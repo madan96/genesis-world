@@ -160,3 +160,6 @@ outputs/
 
 # Local benchmark archive (not versioned)
 /benchmarks/
+
+# SPH temporary output written by tests
+genesis/ext/output/
