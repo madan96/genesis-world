@@ -3,6 +3,8 @@ from .options import *
 from .options import Raycaster as Lidar
 from .raycaster import *
 from .tactile import *
+from .tactile_profile import TactileHardwareProfile, TactileTransferCurve
+from .solver_contact import SolverContactTaxel
 
 from .options import SensorOptions
 

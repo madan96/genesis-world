@@ -9,6 +9,7 @@ from . import (
     point_cloud_tactile,
     probe,
     raycaster,
+    solver_contact_tactile,
     surface_distance_probe,
     temperature,
 )
