@@ -118,6 +118,9 @@ class LegacyCouplerOptions(BaseCouplerOptions):
     mpm_pbd: StrictBool = True
     fem_mpm: StrictBool = True
     fem_sph: StrictBool = True
+    enable_contact_telemetry: StrictBool | None = None
+    contact_buffer_capacity: PositiveInt = 16384
+    rigid_pushout_speed: NonNegativeFloat = 0.0
 
 
 class SAPCouplerOptions(BaseCouplerOptions):

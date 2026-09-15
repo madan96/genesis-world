@@ -707,6 +707,9 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
         if self._constraints_initialized:
             self.apply_particle_constraints(f, self.sim.coupler.rigid_solver.dyn_state.links)
 
+        if self.sim.coupler.rigid_impulses is not None:
+            self.sim.coupler.rigid_impulses.apply()
+
         # Eager sparse reset: zero only the cells p2g touched this substep, across all envs, then clear the global
         # dirty count so the next substep starts fresh. The grid is no longer read after g2p / constraints, so it is
         # safe to wipe here. Forward-only; backward composes p2g/g2p through autodiff and uses reset_grid_and_grad.

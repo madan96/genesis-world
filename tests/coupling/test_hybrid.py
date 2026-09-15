@@ -505,3 +505,46 @@ def test_sap_fem_vs_robot(show_viewer):
 
     # Check that the legs of the ants are resting on the sphere
     assert_allclose(robot.get_qpos()[-4:].abs(), 1.0, tol=0.1)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("approaching", [False, True])
+@pytest.mark.parametrize("n_envs", [0, 2])
+def test_mpm_regions_do_not_weld(approaching, n_envs, tol):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=1e-4, gravity=(0.0, 0.0, 0.0)),
+        mpm_options=gs.options.MPMOptions(
+            lower_bound=(-0.5, -0.5, -0.5),
+            upper_bound=(0.5, 0.5, 0.5),
+            grid_density=32,
+            particle_size=0.02,
+        ),
+        show_viewer=False,
+    )
+    entities = [
+        scene.add_entity(
+            morph=gs.morphs.Box(pos=(x, 0.0, 0.0), size=(0.02, 0.08, 0.08)),
+            material=gs.materials.MPM.Elastic(E=100.0, nu=0.2, rho=1000.0, sampler="regular"),
+        )
+        for x in (-0.015, 0.015)
+    ]
+    scene.build(n_envs=n_envs)
+    speed = 0.1 if approaching else -0.1
+    for i, entity in enumerate(entities):
+        entity.set_particles_vel(((-1) ** i * speed, 0.0, 0.0))
+    initial_positions = [entity.get_particles_pos().clone() for entity in entities]
+    scene.step()
+    velocities = [entity.get_particles_vel() for entity in entities]
+    assert_allclose(velocities[0].sum(dim=-2) + velocities[1].sum(dim=-2), 0.0, tol=tol)
+    for i, entity in enumerate(entities):
+        assert_allclose(velocities[i][..., 1:], 0.0, tol=tol)
+        if approaching:
+            assert (velocities[i][..., 0].abs() < 0.09).all()
+        else:
+            expected = ((-1) ** i * speed, 0.0, 0.0)
+            assert_allclose(velocities[i], expected, tol=tol)
+            assert_allclose(
+                entity.get_particles_pos(),
+                initial_positions[i] + scene.dt * torch.tensor(expected, dtype=gs.tc_float, device=gs.device),
+                tol=tol,
+            )

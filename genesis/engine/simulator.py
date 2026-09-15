@@ -393,6 +393,11 @@ class Simulator(RBC):
         setting _tgt state using external commands
         note that external inputs are given at step level, not substep
         """
+        if not in_backward:
+            if isinstance(self._coupler, LegacyCoupler):
+                self._coupler.on_step_begin()
+            for binding in self.mpm_solver._hybrid_bindings:
+                binding.reset(self.scene._envs_idx)
         for solver in self._active_solvers:
             solver.process_input(in_backward=in_backward)
 
