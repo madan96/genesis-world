@@ -279,6 +279,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         self._box_box_detection = options.box_box_detection
         self._requires_grad = self._sim.options.requires_grad
         self._enable_heterogeneous = False  # Set to True when any entity has heterogeneous morphs
+        self._passive_models = []
 
         # The differentiable solve keeps every body in its iteration trace, so hibernation stays off there (see the
         # use_hibernation option).
@@ -387,6 +388,8 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         self._init_collider()
         self._init_constraint_solver()
         self._refresh_invweight_and_meaninertia(force_update=False, in_place=True)
+        for model in self._passive_models:
+            model._build()
 
         # Fill in the default rotor inertia (see 'KinematicVariantDescription'), one variant per environment. It is
         # written to the armature field from the host once the parsed inverse weights stand, and a second refresh
@@ -590,6 +593,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             backend=gs.backend,
             para_level=self.sim._para_level,
             requires_grad=self.sim.options.requires_grad,
+            has_passive_joints=bool(self._passive_models),
             use_hibernation=self._use_hibernation,
             batch_links_info=self._options.batch_links_info,
             batch_dofs_info=self._options.batch_dofs_info,
@@ -1311,6 +1315,11 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         # from genesis.utils.tools import create_timer
         from genesis.engine.couplers import SAPCoupler
 
+        if self._passive_models:
+            self.dyn_state.dofs.qf_passive_model.fill(0.0)
+            for model in self._passive_models:
+                model._evaluate(is_apply=True)
+
         if self._requires_grad and f == 0:
             kernel_save_adjoint_cache(f, self.dyn_state, self._rigid_adjoint_cache, self.rigid_info, self.rigid_config)
 
@@ -1927,6 +1936,9 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         yield from super().data
         yield from self.collider.data
         yield from self.constraint_solver.data
+        for i_m, model in enumerate(self._passive_models):
+            for item in model.data:
+                yield array_class.DataItem(f"passive_models.{i_m}.{item.name}", item.value, item.kind)
 
     def _restart(self):
         """Clear the contact and equality caches of the last query and re-arm the once-per-step propeller guard of
@@ -3234,6 +3246,9 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         the elastic energy stored by holding each DOF away from its neutral position. Both are state functions, so
         their sum with the kinetic energy is conserved by a passive, frictionless, contact-free model.
 
+        Configured passive models contribute their neutral-spring and soft-limit potentials. A DOF selection must
+        include all or none of each coupled-limit group's members.
+
         Contacts contribute nothing: they are resolved by the constraint solver, which stabilizes a penetration
         rather than storing it as an elastic potential.
 
@@ -3272,7 +3287,11 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         if self.n_envs == 0:
             spring_energy = spring_energy[0]
 
-        return potential_energy + spring_energy
+        potential_energy = potential_energy + spring_energy
+        for model in self._passive_models:
+            model_energy = model.get_potential_energy(dofs_idx, envs_idx)
+            potential_energy += model_energy[0] if self.n_envs == 0 else model_energy
+        return potential_energy
 
     def get_total_energy(self, envs_idx=None):
         """Get the total mechanical energy of all entities in Joules [J] (kinetic + potential).

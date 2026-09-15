@@ -8,6 +8,7 @@ import torch
 
 import genesis as gs
 from genesis.constants import link_ref_frame
+from genesis.engine.passive_joints import PassiveJointModel
 from genesis.engine.states.entities import RigidEntityState
 from genesis.typing import UnitVec4FType, Vec3FType
 from genesis.utils import geom as gu
@@ -1779,7 +1780,22 @@ class RigidEntity(KinematicEntity):
 
     _description_cls = RigidEntityDescription
 
+    @gs.assert_unbuilt
+    def configure_passive_joints(self, dofs_idx_local=None, friction_vel_eps=0.05) -> PassiveJointModel:
+        """Add a passive model over the selected scalar joints before building the scene.
+
+        The default selects every revolute and prismatic joint. The returned model configures neutral springs,
+        damping, friction and soft limits per environment, alongside the entity's actuator commands.
+        """
+        return PassiveJointModel(self, dofs_idx_local, friction_vel_eps)
+
+    @property
+    def passive_joint_models(self) -> tuple[PassiveJointModel, ...]:
+        """Passive models registered on this entity, in their registration order."""
+        return tuple(self._passive_models)
+
     def __init__(self, scene: "Scene", solver: "RigidSolver", idx: int, desc: RigidEntityDescription):
+        self._passive_models: list[PassiveJointModel] = []
         self._geom_start = solver.n_geoms
         self._cell_start = solver.n_cells
         self._vert_start = solver.n_verts
@@ -1795,6 +1811,9 @@ class RigidEntity(KinematicEntity):
         self._batch_fixed_verts: bool = desc.morphs[0].batch_fixed_verts
 
         super().__init__(scene, solver, idx, desc)
+
+        for passive_desc in desc.passive_joints:
+            PassiveJointModel(self, _desc=passive_desc)
 
     def _add_heterogeneous_variant(self, link, v_link):
         # Add collision geometries
@@ -3087,7 +3106,8 @@ class RigidEntity(KinematicEntity):
         Gravity contributes ``-sum_i(m_i * g^T * p_i)`` over the links of the entity free to move, where ``p_i`` is the
         center-of-mass position of link *i* and ``g`` is the gravity vector obtained from the solver. Its joint springs
         contribute ``0.5 * sum_d(stiffness_d * (q_d - q0_d)^2)``, the elastic energy stored by holding each DOF away
-        from its neutral position.
+        from its neutral position. Configured passive models also contribute their neutral-spring and soft-limit
+        potentials, including coupled limits.
 
         Parameters
         ----------

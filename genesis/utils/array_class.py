@@ -2080,6 +2080,7 @@ class DofsState:
     force: qd.Tensor
     qf_bias: qd.Tensor
     qf_passive: qd.Tensor
+    qf_passive_model: qd.Tensor = of_kind(DataKind.SCRATCH)
     qf_actuator: qd.Tensor
     qf_applied: qd.Tensor
     act_length: qd.Tensor
@@ -2116,6 +2117,7 @@ def get_dofs_state(solver):
         force=V(dtype=gs.qd_float, shape=shape, needs_grad=requires_grad),
         qf_bias=V(dtype=gs.qd_float, shape=shape, needs_grad=requires_grad),
         qf_passive=V(dtype=gs.qd_float, shape=shape, needs_grad=requires_grad),
+        qf_passive_model=V(dtype=gs.qd_float, shape=maybe_shape(shape, solver.rigid_config.has_passive_joints)),
         qf_actuator=V(dtype=gs.qd_float, shape=shape, needs_grad=requires_grad),
         qf_applied=V(dtype=gs.qd_float, shape=shape, needs_grad=requires_grad),
         act_length=V(dtype=gs.qd_float, shape=shape, needs_grad=requires_grad),
@@ -2859,6 +2861,7 @@ class RigidSimStaticConfig(metaclass=AutoInitMeta):
     integrator: int
     solver_type: int
     requires_grad: bool
+    has_passive_joints: bool = False
     prefer_decomposed_solver: int = -1  # -1 = None (auto), 0 = False, 1 = True
     # Whether the cone-free assembled Hessian is persisted in nt_H's mirror slots (diagonal in nt_H_cone_free_diag);
     # see the nt_H declaration for the packed-storage mechanics and the rigid solver's resolution for the gating.

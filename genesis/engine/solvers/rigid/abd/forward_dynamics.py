@@ -1525,6 +1525,9 @@ def func_torque_and_passive_force(
 
                 if qd.abs(force) > EPS:
                     wakeup = True
+                if qd.static(rigid_config.has_passive_joints):
+                    if qd.abs(dyn_state.dofs.qf_passive_model[i_d, i_b]) > EPS:
+                        wakeup = True
 
             dof_start = dyn_info.links.dof_start[I_l]
             if joint_type == gs.JOINT_TYPE.FREE and (
@@ -1589,6 +1592,8 @@ def func_torque_and_passive_force(
         if is_awake:
             I_d = [i_d, i_b] if qd.static(rigid_config.batch_dofs_info) else i_d
             dyn_state.dofs.qf_passive[i_d, i_b] = -dyn_info.dofs.damping[I_d] * dyn_state.dofs.vel[i_d, i_b]
+            if qd.static(rigid_config.has_passive_joints):
+                dyn_state.dofs.qf_passive[i_d, i_b] += dyn_state.dofs.qf_passive_model[i_d, i_b]
 
     qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
     for i_l, i_b in qd.ndrange(dyn_info.links.root_idx.shape[0], dyn_state.dofs.ctrl_mode.shape[1]):
@@ -2287,6 +2292,9 @@ def func_count_settled_step(
         max_vel = qd.max(max_vel, dyn_info.dofs.dof_length[I_d] * qd.abs(dyn_state.dofs.vel_next[i_d, i_b]))
         if qd.abs(dyn_state.dofs.qf_applied[i_d, i_b]) > EPS:
             is_driven = True
+        if qd.static(rigid_config.has_passive_joints):
+            if qd.abs(dyn_state.dofs.qf_passive_model[i_d, i_b]) > EPS:
+                is_driven = True
     if max_vel < rigid_info.hibernation_thresh_vel[None] and not is_driven:
         if dyn_state.links.awake_steps[i_l, i_b] < rigid_config.hibernation_min_steps:
             dyn_state.links.awake_steps[i_l, i_b] = dyn_state.links.awake_steps[i_l, i_b] + 1

@@ -10,6 +10,35 @@ from genesis.utils.misc import get_assets_dir
 
 
 @pytest.fixture
+def independent_scalar_joints():
+    def model(joint_type="hinge"):
+        mjcf = ET.Element("mujoco")
+        ET.SubElement(mjcf, "compiler", angle="radian")
+        worldbody = ET.SubElement(mjcf, "worldbody")
+        for i, reference in enumerate((0.4, -0.3)):
+            body = ET.SubElement(worldbody, "body", name=f"body_{i}", pos=f"{i} 0 1")
+            ET.SubElement(
+                body,
+                "joint",
+                name=f"joint_{i}",
+                type=joint_type,
+                axis="0 0 1",
+                ref=str(reference),
+                armature="0.068" if joint_type == "hinge" else "0",
+            )
+            ET.SubElement(
+                body,
+                "geom",
+                type="sphere",
+                size="0.2" if joint_type == "hinge" else "0.02",
+                mass="2" if joint_type == "hinge" else "0.1",
+            )
+        return ET.tostring(mjcf, encoding="unicode")
+
+    return model
+
+
+@pytest.fixture
 def articulated_variants():
     models = []
     for length, angle in ((0.2, 0.0), (0.4, 90.0)):

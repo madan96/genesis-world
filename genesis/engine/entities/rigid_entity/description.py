@@ -24,6 +24,7 @@ import genesis as gs
 from genesis.constants import EQUALITY_TYPE, GEOM_TYPE, JOINT_TYPE
 from genesis.engine.materials.base import Material
 from genesis.engine.mesh import InertialProperties
+from genesis.engine.passive_joints import PassiveJointDescription
 from genesis.options.morphs import Morph
 from genesis.options.options import Options
 from genesis.options.surfaces import Surface
@@ -1487,6 +1488,7 @@ class RigidEntityDescription(KinematicEntityDescription):
 
     links: list[RigidLinkDescription] = field(default_factory=list)
     equalities: list[RigidEqualityDescription] = field(default_factory=list)
+    passive_joints: list[PassiveJointDescription] = field(default_factory=list)
 
     def _describe_variant_link(self, i_link, v_l_info, cg_infos, vg_infos, morph, inertial_info):
         """Describe what one variant gives one simulated link, the inertial it is simulated with included.
