@@ -1,4 +1,5 @@
 import functools
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +15,12 @@ from genesis.engine.states.cache import QueriedStates
 from genesis.utils.misc import to_gs_tensor, broadcast_tensor
 
 from .base_entity import Entity
+
+
+@dataclass(frozen=True)
+class ParticleTarget:
+    values: gs.Tensor
+    envs_idx: torch.Tensor
 
 
 def assert_active(method):
@@ -397,7 +404,11 @@ class ParticleEntity(Entity):
 
     def process_input(self, in_backward: bool = False):
         """
-        Push position, velocity, and activation target states into the simulator.
+        Apply queued particle inputs to their selected environments.
+
+        Each setter replaces its previous pending input, including its environment selection.
+        Position is applied before velocity. Pending inputs survive a scene reset and are consumed
+        by the next call; checkpoint replay retains their original environment selections.
 
         Parameters
         ----------
@@ -413,29 +424,28 @@ class ParticleEntity(Entity):
             for key in self._tgt_keys:
                 self._tgt_buffer[key].append(self._tgt[key])
 
-        if any(self._tgt[key] is not None for key in self._tgt_keys):
-            particles_idx_local = self._sanitize_particles_idx_local(envs_idx=self._scene._envs_idx)
-
-        # Note that setting positions resets velocities to zero, so it must be done BEFORE setting velocities
-        if self._tgt["pos"] is not None:
-            self._tgt["pos"].assert_contiguous()
-            self._tgt["pos"].assert_sceneless()
-            self.set_particles_pos(self._tgt["pos"], particles_idx_local)
-
-        if self._tgt["vel"] is not None:
-            self._tgt["vel"].assert_contiguous()
-            self._tgt["vel"].assert_sceneless()
-            self.set_particles_vel(self._tgt["vel"], particles_idx_local)
-
-        if self._tgt["act"] is not None:
-            self._tgt["act"].assert_contiguous()
-            self._tgt["act"].assert_sceneless()
-            act_values = torch.tensor((gs.ACTIVE, gs.INACTIVE), dtype=gs.tc_int, device=gs.device)
-            assert torch.isin(self._tgt["act"], act_values).all()
-            self.set_particles_active(self._tgt["act"], particles_idx_local)
+        self._apply_particle_targets()
 
         for key in self._tgt_keys:
             self._tgt[key] = None
+
+    def _apply_particle_targets(self):
+        # Setters accept an explicit selection only on batched scenes. An unbatched scene has one environment, so its
+        # queued selection is the scene's own and passes as None.
+        is_batched = self._scene.n_envs > 0
+
+        # Note that setting positions resets velocities to zero, so it must be done BEFORE setting velocities
+        if self._tgt["pos"] is not None:
+            target = self._tgt["pos"]
+            self.set_particles_pos(target.values, envs_idx=target.envs_idx if is_batched else None)
+
+        if self._tgt["vel"] is not None:
+            target = self._tgt["vel"]
+            self.set_particles_vel(target.values, envs_idx=target.envs_idx if is_batched else None)
+
+        if self._tgt["act"] is not None:
+            target = self._tgt["act"]
+            self.set_particles_active(target.values, envs_idx=target.envs_idx if is_batched else None)
 
     def process_input_grad(self):
         """
@@ -447,16 +457,24 @@ class ParticleEntity(Entity):
         Clears the gradients in the solver to avoid double accumulation.
         """
         _tgt_pos = self._tgt_buffer["pos"].pop()
-        if _tgt_pos is not None and _tgt_pos.requires_grad:
-            _tgt_pos._backward_from_qd(self._set_particles_pos_grad)
+        if _tgt_pos is not None and _tgt_pos.values.requires_grad:
+            _tgt_pos.values._backward_from_qd(
+                functools.partial(self._set_particles_pos_grad, envs_idx=_tgt_pos.envs_idx)
+            )
 
         _tgt_vel = self._tgt_buffer["vel"].pop()
-        if _tgt_vel is not None and _tgt_vel.requires_grad:
-            _tgt_vel._backward_from_qd(self._set_particles_vel_grad)
+        if _tgt_vel is not None and _tgt_vel.values.requires_grad:
+            _tgt_vel.values._backward_from_qd(
+                functools.partial(self._set_particles_vel_grad, envs_idx=_tgt_vel.envs_idx)
+            )
 
         # Manually zero the grad since manually setting state breaks gradient flow
-        if _tgt_vel is not None or _tgt_pos is not None:
-            self._reset_grad()
+        for key, target in (("pos", _tgt_pos), ("vel", _tgt_vel)):
+            if target is not None:
+                self._reset_target_grad(key, target.envs_idx)
+
+    def _reset_target_grad(self, key, envs_idx):
+        self._reset_grad()
 
     def collect_output_grads(self):
         """
@@ -470,15 +488,17 @@ class ParticleEntity(Entity):
     # ---------------------------------- io & control ------------------------------------
     # ------------------------------------------------------------------------------------
 
-    @assert_active
+    @gs.assert_built
     def _set_particles_target_state(self, key, name, element_shape, dtype, tensor, envs_idx=None):
         if self.sim.requires_grad and self.sim.cur_t > 0.0:
             gs.logger.warning(
                 f"Manually setting particle '{name}'. This is not recommended because it breaks gradient flow."
             )
         envs_idx = self._scene._sanitize_envs_idx(envs_idx)
-        vel_ = self._sanitize_particles_tensor(tensor, dtype, None, envs_idx, element_shape)
-        self._tgt[key] = to_gs_tensor(vel_)
+        values = to_gs_tensor(self._sanitize_particles_tensor(tensor, dtype, None, envs_idx, element_shape)).clone()
+        values.assert_contiguous()
+        values.assert_sceneless()
+        self._tgt[key] = ParticleTarget(values, envs_idx.clone())
 
     def set_position(self, value, envs_idx=None):
         """
@@ -614,7 +634,10 @@ class ParticleEntity(Entity):
             The indices of the environments to set. If None, all environments will be considered. Defaults to None.
         """
         self._set_particles_target_state("act", "activeness", (), gs.tc_bool, actives, envs_idx)
-        self.active = bool((self._tgt["act"] == gs.ACTIVE).any())
+        active = self.get_particles_active().reshape(self._scene._B, self.n_particles).clone()
+        target = self._tgt["act"]
+        active[target.envs_idx] = target.values
+        self.active = bool(active.any())
 
     def activate(self):
         """

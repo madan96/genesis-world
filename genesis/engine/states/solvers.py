@@ -175,9 +175,32 @@ class ToolSolverState:
     #            f'entities : {_repr(self.entities)}'
 
 
-class MPMSolverState(RBC):
+@dataclasses.dataclass(frozen=True)
+class MPMGridDiagnostics:
+    """Owned grid observations with an environment axis first.
+
+    Origins use integer world-cell coordinates or world meters. Occupancy bounds use world meters and contain
+    (+inf, -inf) for empty environments. Counts and error flags are per environment; allocation sizes are scalars.
     """
-    Dynamic state queried from a MPMSolver.
+
+    origin_cell: torch.Tensor
+    origin_world: torch.Tensor
+    occupancy_lower: torch.Tensor
+    occupancy_upper: torch.Tensor
+    active_particles: torch.Tensor
+    active_cell_substeps: torch.Tensor
+    window_too_small: torch.Tensor
+    invalid_particle_state: torch.Tensor
+    allocated_cells_per_env: int
+    dense_cells_per_env: int
+
+
+class MPMSolverState(RBC):
+    """Owned MPM particle state with an environment axis first.
+
+    Positions and velocities use world coordinates in meters and meters per second. ``grid_origin`` contains integer
+    world-cell coordinates, shape ``(B, 3)``. Attachment frequency and damping arrays have shape ``(B, n_bindings)``
+    and units 1/s and dimensionless. They restore the attachment parameters of the environments selected by reset.
     """
 
     def __init__(self, scene):
@@ -192,8 +215,13 @@ class MPMSolverState(RBC):
         self._C = gs.zeros((scene.sim._B, scene.sim.mpm_solver.n_particles, 3, 3), **args)
         self._F = gs.zeros((scene.sim._B, scene.sim.mpm_solver.n_particles, 3, 3), **args)
         self._Jp = gs.zeros((scene.sim._B, scene.sim.mpm_solver.n_particles), **args)
-        args["dtype"] = gs.tc_bool
+        self._actu = gs.zeros((scene.sim._B, scene.sim.mpm_solver.n_particles), **args)
         args["requires_grad"] = False
+        self._attachment_omega = gs.zeros((scene.sim._B, len(scene.sim.mpm_solver._hybrid_bindings)), **args)
+        self._attachment_damping_ratio = gs.zeros((scene.sim._B, len(scene.sim.mpm_solver._hybrid_bindings)), **args)
+        args["dtype"] = gs.tc_int
+        self._grid_origin = gs.zeros((scene.sim._B, 3), **args)
+        args["dtype"] = gs.tc_bool
         self._active = gs.zeros((scene.sim._B, scene.sim.mpm_solver.n_particles), **args)
 
     @property
@@ -223,6 +251,22 @@ class MPMSolverState(RBC):
     @property
     def active(self):
         return self._active
+
+    @property
+    def actu(self):
+        return self._actu
+
+    @property
+    def grid_origin(self):
+        return self._grid_origin
+
+    @property
+    def attachment_omega(self):
+        return self._attachment_omega
+
+    @property
+    def attachment_damping_ratio(self):
+        return self._attachment_damping_ratio
 
 
 class SPHSolverState:

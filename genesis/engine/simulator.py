@@ -349,6 +349,8 @@ class Simulator(RBC):
         # continue growing endlessly, which will not make the simulation faster either.
         if self.rigid_solver.is_active and self._cur_substep_global % RATE_CHECK_ERRNO == 0:
             self.rigid_solver.check_errno()
+        if self.mpm_solver.is_active and self._cur_substep_global % RATE_CHECK_ERRNO == 0:
+            self.mpm_solver.check_errno()
 
         # Reconstructing a checkpoint window replays steps the environments already simulated, so only a forward step
         # advances their clock. The backward pass winds it down again through `_step_grad`.

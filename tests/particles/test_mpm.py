@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import pytest
 import torch
@@ -6,6 +8,251 @@ import trimesh
 import genesis as gs
 
 from ..utils.assertions import assert_allclose
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("grid_mode", ["fixed_dense", "moving_window"])
+def test_grid_state_reset(grid_mode, show_viewer):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=0.001,
+            substeps_local=4,
+            gravity=(0, 0, -2),
+        ),
+        mpm_options=gs.options.MPMOptions(
+            grid_density=16,
+            particle_size=0.04,
+            lower_bound=(-1, -1, -1),
+            upper_bound=(1, 1, 1),
+            grid_mode=grid_mode,
+            window_size=(1, 1, 1) if grid_mode == "moving_window" else None,
+        ),
+        show_viewer=show_viewer,
+    )
+    entity = scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(0.12, 0.12, 0.12),
+        ),
+        material=gs.materials.MPM.Elastic(
+            E=1000,
+            nu=0.2,
+            sampler="regular",
+        ),
+    )
+    scene.build(n_envs=3)
+    solver = scene.sim.mpm_solver
+    centers = torch.tensor([[-0.3, 0, 0.1], [0.25, 0, 0.15], [0, -0.2, 0.2]], dtype=gs.tc_float, device=gs.device)
+    velocity = torch.tensor([[0.4, 0, 0.1], [-0.2, 0.1, 0.2], [0.3, -0.2, 0]], dtype=gs.tc_float, device=gs.device)
+    initial_position = entity.get_particles_pos().clone() + centers[:, None]
+    entity.set_position(centers)
+    entity.set_velocity(velocity[:, None])
+    scene.step()
+    snapshot = scene.get_state()
+    saved_diagnostics = solver.get_grid_diagnostics()
+    entity.set_particles_active(False, envs_idx=[2])
+    for _ in range(2):
+        scene.step()
+    before = entity.get_particles_pos().clone()
+    diagnostics = solver.get_grid_diagnostics()
+    assert_allclose(diagnostics.active_particles, [entity.n_particles, entity.n_particles, 0], atol=0)
+    selection = torch.tensor([True, False, True], device=gs.device)
+    scene.reset(snapshot, envs_idx=selection)
+    assert_allclose(entity.get_particles_pos(envs_idx=[1]), before[1:2], atol=1e-7)
+    restored_diagnostics = solver.get_grid_diagnostics()
+    expected_origin = diagnostics.origin_cell.clone()
+    expected_origin[selection] = saved_diagnostics.origin_cell[selection]
+    assert_allclose(restored_diagnostics.origin_cell, expected_origin, atol=0)
+    assert_allclose(restored_diagnostics.active_particles, entity.n_particles, atol=0)
+    if grid_mode == "moving_window":
+        assert restored_diagnostics.allocated_cells_per_env < restored_diagnostics.dense_cells_per_env / 5
+        assert not torch.equal(expected_origin[0], expected_origin[1])
+    scene.step()
+    steps = torch.tensor([2, 4, 2], dtype=gs.tc_float, device=gs.device)
+    expected_velocity = velocity.clone()
+    expected_velocity[:, 2] -= 2 * steps * scene.dt
+    displacement = velocity * (steps * scene.dt)[:, None]
+    displacement[:, 2] -= steps * (steps + 1) * scene.dt**2
+    assert_allclose(entity.get_particles_vel(), expected_velocity[:, None], atol=3e-5)
+    assert_allclose(entity.get_particles_pos(), initial_position + displacement[:, None], atol=2e-6)
+    # The saved state owns its buffers and can be restored again using integer indices after further stepping.
+    scene.reset(snapshot, envs_idx=[1])
+    expected_velocity[1] = velocity[1]
+    expected_velocity[1, 2] -= 2 * scene.dt
+    assert_allclose(entity.get_particles_vel(), expected_velocity[:, None], atol=3e-5)
+
+
+@pytest.mark.required
+def test_window_stencil_recovery(show_viewer):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=0.001,
+            gravity=(0, 0, 0),
+        ),
+        mpm_options=gs.options.MPMOptions(
+            grid_density=16,
+            particle_size=0.04,
+            lower_bound=(-1, -1, -1),
+            upper_bound=(1, 1, 1),
+            grid_mode="moving_window",
+            window_size=(0.5, 0.5, 0.5),
+        ),
+        show_viewer=show_viewer,
+    )
+    entity = scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(0.12, 0.12, 0.12),
+        ),
+        material=gs.materials.MPM.Elastic(
+            E=1000,
+            nu=0.2,
+            sampler="regular",
+        ),
+    )
+    scene.build(n_envs=2)
+    solver = scene.sim.mpm_solver
+    initial = entity.get_particles_pos().clone()
+    displaced = initial[1:2].clone()
+    displaced[:, 0, 0] = 0.6
+    entity.set_particles_pos(displaced, envs_idx=[1])
+    with pytest.raises(gs.GenesisException, match="stencil padding"):
+        for _ in range(11):
+            scene.step()
+    assert_allclose(solver.get_grid_diagnostics().window_too_small, [False, True], atol=0)
+    scene.reset(envs_idx=[1])
+    scene.step()
+    assert_allclose(solver.get_grid_diagnostics().window_too_small, False, atol=0)
+    assert_allclose(entity.get_particles_pos(), initial, atol=2e-6)
+    assert_allclose(entity.get_particles_vel(), 0, atol=3e-5)
+    invalid = initial[1:2].clone()
+    invalid[:, 0, 0] = float("nan")
+    entity.set_particles_pos(invalid, envs_idx=[1])
+    with pytest.raises(gs.GenesisException, match="finite"):
+        solver.check_errno()
+    scene.reset(envs_idx=[1])
+    solver.check_errno()
+    assert_allclose(solver.get_grid_diagnostics().invalid_particle_state, False, atol=0)
+
+
+@pytest.mark.required
+def test_muscle_state_reset(show_viewer):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=0.001,
+            substeps_local=4,
+            gravity=(0, 0, 0),
+        ),
+        mpm_options=gs.options.MPMOptions(
+            grid_density=16,
+            particle_size=0.04,
+            lower_bound=(-0.5, -0.5, -0.5),
+            upper_bound=(0.5, 0.5, 0.5),
+        ),
+        show_viewer=show_viewer,
+    )
+    entity = scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(0.12, 0.12, 0.12),
+        ),
+        material=gs.materials.MPM.Muscle(
+            E=1000,
+            nu=0.2,
+            sampler="regular",
+        ),
+    )
+    scene.build(n_envs=2)
+    initial = entity.get_particles_pos().clone()
+    entity.set_particles_actu(0.4)
+    snapshot = scene.get_state()
+    for _ in range(2):
+        scene.step()
+    reference_position = entity.get_particles_pos().clone()
+    reference_velocity = entity.get_particles_vel().clone()
+    assert_allclose(entity.get_particles_actu(), 0.4, atol=1e-7)
+    assert_allclose(reference_position.mean(dim=1), initial.mean(dim=1), atol=1e-7)
+    assert (reference_velocity.norm(dim=-1).max(dim=1).values > 1e-4).all()
+    assert (reference_position[:, :, 2].amax(dim=1) < initial[:, :, 2].amax(dim=1)).all()
+    entity.set_particles_actu(0, envs_idx=[0])
+    entity.set_particles_actu(-0.2, envs_idx=[1])
+    scene.reset(snapshot, envs_idx=[0])
+    assert_allclose(entity.get_particles_actu(), [[0.4], [-0.2]], atol=1e-7)
+    for _ in range(2):
+        scene.step()
+    assert_allclose(entity.get_particles_pos(envs_idx=[0]), reference_position[:1], atol=2e-6)
+    assert_allclose(entity.get_particles_vel(envs_idx=[0]), reference_velocity[:1], atol=3e-5)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("n_envs", [0, 2])
+def test_window_world_contact(n_envs, show_viewer):
+    final_states = {}
+    for grid_mode in ("fixed_dense", "moving_window"):
+        scene = gs.Scene(
+            sim_options=gs.options.SimOptions(
+                dt=0.002,
+                gravity=(0, 0, 0),
+            ),
+            mpm_options=gs.options.MPMOptions(
+                grid_density=16,
+                particle_size=0.04,
+                lower_bound=(-2, -0.5, -0.5),
+                upper_bound=(2, 0.5, 0.5),
+                grid_mode=grid_mode,
+                window_size=(0.75, 0.75, 0.75) if grid_mode == "moving_window" else None,
+            ),
+            show_viewer=show_viewer,
+        )
+        scene.add_entity(
+            morph=gs.morphs.Box(
+                pos=(1, 0, 0),
+                size=(0.2, 0.5, 0.5),
+                fixed=True,
+            ),
+            material=gs.materials.Rigid(
+                coup_friction=0,
+            ),
+        )
+        entity = scene.add_entity(
+            morph=gs.morphs.Box(
+                size=(0.12, 0.12, 0.12),
+            ),
+            material=gs.materials.MPM.Elastic(
+                E=1000,
+                nu=0.2,
+                sampler="regular",
+            ),
+        )
+        scene.build(n_envs=n_envs)
+        solver = scene.sim.mpm_solver
+        initial = entity.get_particles_pos().clone()
+        initial_origin = solver.get_grid_diagnostics().origin_world
+        velocity = torch.tensor([[4, 0, 0], [-4, 0, 0]][: max(n_envs, 1)], dtype=gs.tc_float, device=gs.device)
+        entity.set_particles_vel(velocity[:, None] if n_envs else velocity[0])
+        for _ in range(100):
+            scene.step()
+        expected_velocity = velocity[:, None] if n_envs else velocity[0]
+        assert_allclose(entity.get_particles_vel(), expected_velocity, atol=5e-5)
+        assert_allclose(entity.get_particles_pos() - initial, expected_velocity * (100 * scene.dt), atol=1e-5)
+        if grid_mode == "moving_window":
+            displacement = solver.get_grid_diagnostics().origin_world - initial_origin
+            assert (displacement[:, 0].abs() > 0.5).all()
+        for _ in range(50):
+            scene.step()
+        positions = entity.get_particles_pos()
+        velocities = entity.get_particles_vel()
+        if n_envs == 0:
+            positions, velocities = positions[None], velocities[None]
+        # Grid-node coupling stops the material at the first grid node inside the wall face at x = 0.9
+        wall_node_x = math.ceil(0.9 / solver.dx) * solver.dx
+        assert_allclose(positions[0, :, 0].max(), wall_node_x, atol=1e-3)
+        assert velocities[0, :, 0].mean() < 0.4
+        if n_envs:
+            assert_allclose(entity.get_particles_vel(envs_idx=[1]), velocity[1], atol=5e-5)
+            assert_allclose(
+                entity.get_particles_pos(envs_idx=[1]) - initial[1:2], velocity[1] * (150 * scene.dt), atol=1e-5
+            )
+        final_states[grid_mode] = (positions, velocities)
+    assert_allclose(final_states["moving_window"][0], final_states["fixed_dense"][0], atol=1e-5)
+    assert_allclose(final_states["moving_window"][1], final_states["fixed_dense"][1], atol=5e-5)
 
 
 @pytest.mark.required

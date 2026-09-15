@@ -689,6 +689,13 @@ class MPMOptions(GravityMixin, TimeBasedMixin):
         Lower bound of the simulation domain. Defaults to (-1.0, -1.0, 0.0).
     upper_bound : tuple, shape (3,), optional
         Upper bound of the simulation domain. Defaults to (1.0, 1.0, 1.0).
+    grid_mode : {"fixed_dense", "moving_window"}, optional
+        Allocate the whole domain, or a smaller dense window that follows all active particles independently in each
+        environment. The moving window reduces memory for compact material moving through a large domain. It requires
+        forward simulation with CPIC disabled and raises if particles no longer fit with three-cell stencil padding.
+    window_size : tuple, shape (3,), optional
+        Moving grid extent in meters. Required for moving_window; every axis must span at least seven cells and fit
+        within the domain. Defaults to None for fixed_dense.
     use_sparse_grid : bool, optional
         This option is deprecated.
     leaf_block_size : int, optional
@@ -698,6 +705,8 @@ class MPMOptions(GravityMixin, TimeBasedMixin):
     particle_size: PositiveFloat | None = None  # in meters. Will be computed automatically if it's None.
     grid_density: PositiveFloat = 64
     enable_CPIC: StrictBool = False
+    grid_mode: Literal["fixed_dense", "moving_window"] = "fixed_dense"
+    window_size: Vec3FType | None = None
 
     # These will later be converted to discrete grid bound. The actual grid boundary could be slightly tighter.
     lower_bound: Vec3FType = (-1.0, -1.0, 0.0)
@@ -718,8 +727,19 @@ class MPMOptions(GravityMixin, TimeBasedMixin):
         return data
 
     def model_post_init(self, context: Any) -> None:
-        if not np.all(np.array(self.upper_bound) > np.array(self.lower_bound)):
+        if not np.isfinite((self.lower_bound, self.upper_bound)).all() or not np.all(
+            np.array(self.upper_bound) > np.array(self.lower_bound)
+        ):
             gs.raise_exception("Invalid pair of upper_bound and lower_bound.")
+        if self.grid_mode == "moving_window":
+            if (
+                self.window_size is None
+                or not np.isfinite(self.window_size).all()
+                or not np.all(np.asarray(self.window_size) > 0.0)
+            ):
+                gs.raise_exception("moving_window requires a finite positive window_size in meters.")
+        elif self.window_size is not None:
+            gs.raise_exception("window_size requires grid_mode='moving_window'.")
 
 
 class SPHOptions(GravityMixin, TimeBasedMixin):
