@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
+import trimesh
 
 import genesis as gs
 
@@ -1100,3 +1101,38 @@ def test_speed(factory_logger, request, runnable, solver, gjk, n_envs):
         }
     ) as logger:
         logger.write(request.getfixturevalue(runnable))
+
+
+@pytest.mark.parametrize("mesh_kind", ["ellipsoid", "annulus"])
+@pytest.mark.parametrize("backend", [gs.cpu])
+def test_sdf_preprocessing_speed(mesh_kind, factory_logger, monkeypatch, tmp_path):
+    if mesh_kind == "ellipsoid":
+        mesh = trimesh.creation.icosphere(subdivisions=3, radius=0.1)
+        mesh.apply_scale((1.0, 0.6, 1.8))
+    else:
+        mesh = trimesh.creation.annulus(r_min=0.04, r_max=0.05, height=0.08, sections=64)
+    scene = gs.Scene(
+        show_viewer=False,
+    )
+    durations = []
+    for i_trial in range(3):
+        monkeypatch.setenv("GS_CACHE_FILE_PATH", str(tmp_path / str(i_trial)))
+        entity = scene.add_entity(
+            morph=gs.morphs.MeshSet(
+                files=(mesh,),
+                decimate=False,
+                convexify=False,
+                watertighten=None,
+            ),
+            material=gs.materials.Rigid(
+                sdf_min_res=32,
+                sdf_max_res=64,
+            ),
+            vis_mode="collision",
+        )
+        geom = entity.geoms[0]
+        started = time.perf_counter()
+        _ = geom.sdf_val
+        durations.append(time.perf_counter() - started)
+    with factory_logger({"env": "sdf_preprocessing", "mesh": mesh_kind, "cache": "empty"}) as logger:
+        logger.write({"preprocessing_ms": 1000.0 * np.median(durations), "n_cells": geom.n_cells})

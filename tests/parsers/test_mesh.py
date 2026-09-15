@@ -881,6 +881,86 @@ def test_splashsurf_surface_reconstruction(show_viewer):
 # ==================== Mesh Processing/Caching Tests ====================
 
 
+@pytest.mark.required
+@pytest.mark.parametrize("precision", ["32", "64"])
+def test_sdf_preprocessing(precision):
+    scene = gs.Scene(
+        show_viewer=False,
+    )
+    for scale in (0.01, 1.0, 100.0):
+        halfsize = np.array((1.0, 0.8, 0.4)) * scale
+        mesh = trimesh.creation.box(extents=2.0 * halfsize)
+        snapshots = []
+        for _ in range(2):
+            entity = scene.add_entity(
+                morph=gs.morphs.MeshSet(
+                    files=(mesh,),
+                    decimate=False,
+                    convexify=False,
+                    watertighten=None,
+                ),
+                material=gs.materials.Rigid(
+                    sdf_min_res=25,
+                    sdf_max_res=25,
+                ),
+                vis_mode="collision",
+            )
+            geom = entity.geoms[0]
+            values = geom.sdf_val
+            points = np.indices(geom.sdf_res).reshape(3, -1).T
+            points = gu.transform_by_T(points, np.linalg.inv(geom.T_mesh_to_sdf))
+            offsets = np.abs(points) - halfsize
+            outside = np.maximum(offsets, 0.0)
+            distances = np.linalg.norm(outside, axis=-1)
+            expected_values = distances + np.minimum(offsets.max(axis=-1), 0.0)
+            assert_allclose(values.reshape(-1), expected_values, atol=2e-7 * scale, rtol=0.0)
+
+            gradients = np.zeros_like(points)
+            is_outside = distances > 1e-10 * scale
+            gradients[is_outside] = np.sign(points[is_outside]) * outside[is_outside] / distances[is_outside, None]
+            nearest_axes = np.argmax(offsets, axis=-1)
+            gradients[~is_outside, nearest_axes[~is_outside]] = np.sign(points[~is_outside, nearest_axes[~is_outside]])
+            # The interior medial axis has several closest surface points and no unique SDF gradient.
+            face_distances = np.concatenate((halfsize - points, halfsize + points), axis=-1)
+            ordered_distances = np.sort(face_distances, axis=-1)
+            has_unique_gradient = is_outside | (ordered_distances[:, 1] - ordered_distances[:, 0] > 1e-8 * scale)
+            assert_allclose(
+                geom.sdf_grad_flattened[has_unique_gradient], gradients[has_unique_gradient], atol=2e-6, rtol=0.0
+            )
+            assert np.isfinite(geom.sdf_grad).all()
+            assert values.dtype == gs.np_float
+            assert geom.sdf_grad.dtype == gs.np_float
+            vertex_distances = np.linalg.norm(points[:, None] - geom.init_verts, axis=-1)
+            selected_distances = vertex_distances[np.arange(len(points)), geom.sdf_closest_vert_flattened]
+            assert_allclose(selected_distances, vertex_distances.min(axis=-1), atol=2e-7 * scale, rtol=0.0)
+            snapshots.append((values.copy(), geom.sdf_grad.copy(), geom.sdf_closest_vert.copy()))
+        for generated, cached in zip(*snapshots):
+            assert_equal(cached, generated)
+
+    terrain = scene.add_entity(
+        morph=gs.morphs.Terrain(
+            height_field=np.zeros((5, 5)),
+        ),
+        material=gs.materials.Rigid(
+            sdf_min_res=16,
+            sdf_max_res=16,
+        ),
+        vis_mode="collision",
+    )
+    geom = terrain.geoms[0]
+    assert_equal(geom.sdf_grad, 0.0)
+    points = np.indices(geom.sdf_res).reshape(3, -1).T
+    points = gu.transform_by_T(points, np.linalg.inv(geom.T_mesh_to_sdf))
+    lower, upper = geom.init_verts.min(axis=0), geom.init_verts.max(axis=0)
+    distances_to_sides = np.concatenate((points[:, :2] - lower[:2], upper[:2] - points[:, :2]), axis=-1)
+    distances_to_top = points[:, 2] - upper[2]
+    is_top_closest = distances_to_sides.min(axis=-1) > np.abs(distances_to_top)
+    assert_allclose(geom.sdf_val_flattened[is_top_closest], distances_to_top[is_top_closest], atol=2e-7, rtol=0.0)
+    vertex_distances = np.linalg.norm(points[:, None] - geom.init_verts, axis=-1)
+    selected_distances = vertex_distances[np.arange(len(points)), geom.sdf_closest_vert_flattened]
+    assert_allclose(selected_distances, vertex_distances.min(axis=-1), atol=2e-7, rtol=0.0)
+
+
 # FIXME: This test is taking too much time on some platform (~1200s)
 # Counting the decompositions requires a cache that no earlier run has populated.
 @pytest.mark.cache(False)

@@ -189,9 +189,14 @@ class RigidGeom(RBC):
                 X, Y, Z = np.meshgrid(x, y, z, indexing="ij")
                 query_points = np.stack([X, Y, Z], axis=-1).reshape((-1, 3))
 
-                sdf_val = self._compute_sd(query_points)
-                sdf_closest_vert = self._compute_closest_verts(query_points)
-                sdf_val = sdf_val.reshape(self._sdf_res)
+                signed_distance, closest_faces, closest_points, _ = igl.signed_distance(
+                    query_points, self._sdf_verts, self._sdf_faces
+                )
+                # Terrain's distance proxy has its own topology. Contact seeds index the collision mesh.
+                if "sdf_mesh" in self._metadata:
+                    _, closest_faces, *_ = igl.signed_distance(query_points, self._init_verts, self._init_faces)
+                sdf_closest_vert = self._compute_closest_verts(query_points, closest_faces)
+                sdf_val = signed_distance.astype(gs.np_float, copy=False).reshape(self._sdf_res)
                 sdf_closest_vert = sdf_closest_vert.reshape(self._sdf_res)
                 T_mesh_to_centered = np.eye(4)
                 T_mesh_to_centered[:3, 3] = -center
@@ -205,7 +210,9 @@ class RigidGeom(RBC):
                     # dummy
                     sdf_grad = np.zeros((*self._sdf_res, 3), dtype=gs.np_float)
                 else:
-                    sdf_grad = self._compute_sd_grad(query_points, self._sdf_grad_delta).reshape((*self._sdf_res, 3))
+                    sdf_grad = self._compute_sd_grad(query_points, signed_distance, closest_points).reshape(
+                        (*self._sdf_res, 3)
+                    )
 
                 # caching
                 gsd_dict = {
@@ -227,12 +234,7 @@ class RigidGeom(RBC):
 
         self._is_preprocessed = True
 
-    def _compute_sd(self, query_points):
-        signed_distance, *_ = igl.signed_distance(query_points, self._sdf_verts, self._sdf_faces)
-        return signed_distance.astype(gs.np_float, copy=False)
-
-    def _compute_closest_verts(self, query_points):
-        _, closest_faces, *_ = igl.signed_distance(query_points, self._init_verts, self._init_faces)
+    def _compute_closest_verts(self, query_points, closest_faces):
         verts_ids = self._init_faces[closest_faces]
         verts_ids = verts_ids[
             np.arange(len(query_points), dtype=gs.np_int),
@@ -240,23 +242,30 @@ class RigidGeom(RBC):
         ]
         return verts_ids
 
-    def _compute_sd_grad(self, query_points, delta=5e-4):
-        ######## sdf gradient via finite differencing ########
-        # `delta` can be a scalar or a per-axis array (anisotropic SDF cells).
-        delta_arr = np.broadcast_to(np.asarray(delta, dtype=gs.np_float), (3,))
-        dx, dy, dz = float(delta_arr[0]), float(delta_arr[1]), float(delta_arr[2])
-        sd_val_xpos = self._compute_sd(query_points + np.array((dx, 0.0, 0.0), dtype=gs.np_float))
-        sd_val_xneg = self._compute_sd(query_points - np.array((dx, 0.0, 0.0), dtype=gs.np_float))
-        sd_val_ypos = self._compute_sd(query_points + np.array((0.0, dy, 0.0), dtype=gs.np_float))
-        sd_val_yneg = self._compute_sd(query_points - np.array((0.0, dy, 0.0), dtype=gs.np_float))
-        sd_val_zpos = self._compute_sd(query_points + np.array((0.0, 0.0, dz), dtype=gs.np_float))
-        sd_val_zneg = self._compute_sd(query_points - np.array((0.0, 0.0, dz), dtype=gs.np_float))
+    def _compute_sd_grad(self, query_points, signed_distance, closest_points):
+        """Compute signed distance gradients from closest points, using finite differences at surface nodes.
 
-        sd_grad_x = (sd_val_xpos - sd_val_xneg) / (2 * dx)
-        sd_grad_y = (sd_val_ypos - sd_val_yneg) / (2 * dy)
-        sd_grad_z = (sd_val_zpos - sd_val_zneg) / (2 * dz)
-        sd_grad = np.stack([sd_grad_x, sd_grad_y, sd_grad_z], -1)
-        return sd_grad
+        The direction sign(distance) * (point - closest_point) / |point - closest_point| is the gradient where the
+        distance field is differentiable. At a medial axis it selects one closest surface branch. Surface nodes
+        within the closest-point roundoff scale use the per-axis SDF cell stencil. Arithmetic stays in libigl's
+        double precision until the result is converted to the simulation precision.
+        """
+        gradients = query_points - closest_points
+        lengths = np.linalg.norm(gradients, axis=-1)
+        # Subtracting almost coincident points loses gradient direction before it loses distance accuracy.
+        surface_tolerance = np.sqrt(np.finfo(closest_points.dtype).eps) * np.abs(self._sdf_verts).max()
+        is_on_surface = lengths <= surface_tolerance
+        np.divide(gradients, lengths[:, None], out=gradients, where=~is_on_surface[:, None])
+        gradients *= np.where(signed_distance < 0.0, -1.0, 1.0)[:, None]
+        if is_on_surface.any():
+            surface_points = query_points[is_on_surface]
+            for i_axis in range(3):
+                offset = np.zeros(3)
+                offset[i_axis] = self._sdf_grad_delta[i_axis]
+                distance_positive, *_ = igl.signed_distance(surface_points + offset, self._sdf_verts, self._sdf_faces)
+                distance_negative, *_ = igl.signed_distance(surface_points - offset, self._sdf_verts, self._sdf_faces)
+                gradients[is_on_surface, i_axis] = (distance_positive - distance_negative) / (2.0 * offset[i_axis])
+        return gradients.astype(gs.np_float, copy=False)
 
     def get_trimesh(self):
         """
