@@ -29,6 +29,7 @@ from .rigid_joint import RigidJoint
 from .rigid_link import KinematicLink, RigidLink
 
 if TYPE_CHECKING:
+    from genesis.engine.contact_contributions import ContactContributions, ContactLinkWrenches, ContactSource
     from genesis.engine.scene import Scene
     from genesis.engine.solvers.rigid.rigid_solver import RigidSolver
     from genesis.engine.solvers.kinematic_solver import KinematicSolver
@@ -3259,6 +3260,44 @@ class RigidEntity(KinematicEntity):
         links_idx = slice(self.link_start, self.link_end)
         tensor = qd_to_torch(self._solver.dyn_state.links.contact_force, envs_idx, links_idx, transpose=True, copy=True)
         return tensor[0] if self._solver.n_envs == 0 else tensor
+
+    @gs.assert_built
+    def get_contact_contributions(self, source: "ContactSource" = "all") -> "ContactContributions":
+        """Return owned padded contact rows involving this entity on either side.
+
+        The force is applied to the row's A participant, which need not be this
+        entity. Use the indices and reverse its sign for B. The scene contact
+        record documents units, intervals, validity, and snapshot ownership.
+        """
+        return self.scene.get_contact_contributions(source).select(entity_idx=self.idx)
+
+    @gs.assert_built
+    def get_links_contact_wrench(
+        self, source: "ContactSource" = "all", *, reference=(0.0, 0.0, 0.0)
+    ) -> "ContactLinkWrenches":
+        """Return exact owned external contact reductions for this entity's links.
+
+        Shapes always include [B, n_links]. ``reference`` is a world-space point
+        in meters broadcastable to [B, n_links, 3]; torque uses N*m.
+        See Scene.get_links_contact_wrench for temporal and overflow semantics.
+        """
+        from dataclasses import fields
+
+        from genesis.engine.contact_contributions import ContactLinkWrenches
+
+        values = self.scene.get_links_contact_wrench(source)
+        data = {}
+        for field in fields(values):
+            value = getattr(values, field.name)
+            data[field.name] = (
+                value if field.name.endswith("interval") else value[:, self.link_start : self.link_end].clone()
+            )
+        data["reference"] = torch.broadcast_to(
+            torch.as_tensor(reference, dtype=gs.tc_float, device=gs.device), data["force"].shape
+        ).clone()
+        data["torque"] -= data["reference"].cross(data["force"], dim=-1)
+        data["angular_impulse"] -= data["reference"].cross(data["impulse"], dim=-1)
+        return ContactLinkWrenches(**data)
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- friction ---------------------------------------

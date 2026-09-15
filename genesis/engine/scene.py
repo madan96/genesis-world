@@ -20,6 +20,7 @@ import genesis as gs
 import genesis.utils.geom as gu
 import genesis.utils.mesh as mu
 from genesis.engine.entities.base_entity import Entity, EntityDescription
+from genesis.engine.contact_contributions import ContactContributions, ContactLinkWrenches, ContactReader, ContactSource
 from genesis.engine.entities.rigid_entity import KinematicEntity
 from genesis.engine.force_fields import ForceField
 from genesis.engine.materials.base import EntityT, Material
@@ -243,6 +244,7 @@ class Scene(RBC):
 
         # simulator
         self._sim = Simulator(scene=self, options=self.options)
+        self._contact_reader: ContactReader | None = None
 
         # visualizer
         self._visualizer = Visualizer(
@@ -611,6 +613,31 @@ class Scene(RBC):
         """
         return self._sim._sensor_manager.read_sensors(entity_idx=None, envs_idx=envs_idx)
 
+    @gs.assert_built
+    def get_contact_contributions(self, source: ContactSource = "all") -> ContactContributions:
+        """Return owned padded rigid/MPM contact rows with an explicit interval and sign.
+
+        The leading environment dimension is always present. ``valid`` marks live
+        rows and ``is_complete`` reports bounded-buffer loss. Reading uses device
+        tensors without host count synchronization on native zero-copy backends.
+        See ContactContributions for frames, units, counterpart indices, temporal
+        sampling and filtering. Active MPM coupling without telemetry raises.
+        """
+        return self._contact_reader.contributions(source)
+
+    @gs.assert_built
+    def get_links_contact_wrench(
+        self, source: ContactSource = "all", *, reference=(0.0, 0.0, 0.0)
+    ) -> ContactLinkWrenches:
+        """Return exact owned contact reductions for all rigid links, even on row overflow.
+
+        ``reference`` is a world-space point in meters, broadcastable to
+        [B, n_links, 3]. Force/torque use N and N*m. Both source intervals are
+        retained; see ContactLinkWrenches for the mixed temporal convention.
+        Internal hybrid attachment forces are excluded.
+        """
+        return self._contact_reader.wrenches(source, reference=reference)
+
     @gs.assert_unbuilt
     def add_recorder(self, data_func: Callable, rec_options: "RecorderOptions") -> "Recorder":
         """
@@ -865,6 +892,7 @@ class Scene(RBC):
 
             # simulator
             self._sim.build()
+            self._contact_reader = ContactReader(self)
 
             # reset state
             self._reset()
