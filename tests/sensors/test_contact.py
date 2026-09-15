@@ -129,8 +129,9 @@ def test_gravity_force(free_box, n_envs, show_viewer, tol):
     # Add another cube on top of it make sure the forces are correctly aggregated
     box_3.set_dofs_position((-np.pi / 2, -np.pi / 4, -np.pi / 2), dofs_idx_local=slice(3, None))
 
-    # Note that it is necessary to do a first step, because the initial state right after reset is not valid
-    for _ in range(DELAY_STEPS + 1):
+    # The initial state right after reset is not valid, and a delayed read with jitter can reach one step beyond
+    # the delay, so every slot it can sample must hold a stepped value before the first read.
+    for _ in range(DELAY_STEPS + 2):
         scene.step()
 
     # Make sure that box CoM is valid

@@ -11,6 +11,7 @@ from genesis.options.sensors.options import SensorOptions
 from genesis.utils.ring_buffer import TensorRingBuffer
 
 from .base_sensor import Sensor, SharedSensorContext, SharedSensorMetadata
+from .state import SensorManagerState
 
 if TYPE_CHECKING:
     from genesis.vis.rasterizer_context import RasterizerContext
@@ -273,6 +274,70 @@ class SensorManager:
                 sensors_metadata.destroy()
         self._sensors_metadata.clear()
         self._sensors_by_type.clear()
+
+    def get_state(self) -> SensorManagerState:
+        """Capture owned sensor state; future stochastic draws remain under the caller's torch RNG control."""
+        return SensorManagerState(
+            ground_truth_intermediate={
+                key: value.T.clone() for key, value in self._ground_truth_intermediate_cache.items()
+            },
+            measured_intermediate={key: value.clone() for key, value in self._intermediate_cache.items()},
+            ground_truth_timeline={
+                key: torch.stack([ring.at(age) for age in range(ring.N)], dim=1)
+                for key, ring in self._ground_truth_timeline_ring.items()
+            },
+            measured_timeline={
+                key: torch.stack([ring.at(age) for age in range(ring.N)], dim=1)
+                for key, ring in self._measured_timeline_ring.items()
+            },
+            ground_truth_return={key: value.clone() for key, value in self._ground_truth_return_cache.items()},
+            measured_return={key: value.clone() for key, value in self._return_cache.items()},
+            ground_truth_return_timeline={
+                key: torch.stack([ring.at(age) for age in range(ring.N)], dim=1)
+                for key, ring in self._ground_truth_return_timeline_ring.items()
+            },
+            measured_return_timeline={
+                key: torch.stack([ring.at(age) for age in range(ring.N)], dim=1)
+                for key, ring in self._measured_return_timeline_ring.items()
+            },
+            sensor_tensors={
+                sensor_cls: {name: value.clone() for name, value in sensor_cls.state_tensors(metadata)}
+                for sensor_cls, metadata in self._sensors_metadata.items()
+            },
+        )
+
+    def set_state(self, state: SensorManagerState, envs_idx=None) -> None:
+        """Restore selected environments without rewinding global RNG or other environments' ring histories."""
+        if not self._sensors_by_type:
+            return
+        envs_idx = self._sim.scene._sanitize_envs_idx(envs_idx)
+        for context in self._shared_contexts.values():
+            context.reset(envs_idx)
+        for key, value in self._ground_truth_intermediate_cache.items():
+            value[:, envs_idx] = state.ground_truth_intermediate[key][envs_idx].T
+        for current, saved in (
+            (self._intermediate_cache, state.measured_intermediate),
+            (self._ground_truth_return_cache, state.ground_truth_return),
+            (self._return_cache, state.measured_return),
+        ):
+            for key, value in current.items():
+                value[envs_idx] = saved[key][envs_idx]
+        # Ring cursors are shared across environments. Restore by logical age at the current cursor so a partial
+        # restore cannot shift the unselected environments' histories.
+        for current, saved in (
+            (self._ground_truth_timeline_ring, state.ground_truth_timeline),
+            (self._measured_timeline_ring, state.measured_timeline),
+            (self._ground_truth_return_timeline_ring, state.ground_truth_return_timeline),
+            (self._measured_return_timeline_ring, state.measured_return_timeline),
+        ):
+            for key, ring in current.items():
+                for age in range(ring.N):
+                    target = ring.at(age, copy=False)
+                    target[envs_idx] = saved[key][envs_idx, age]
+        for sensor_cls, metadata in self._sensors_metadata.items():
+            for name, value in sensor_cls.state_tensors(metadata):
+                value[envs_idx] = state.sensor_tensors[sensor_cls][name][envs_idx]
+            sensor_cls.state_restored(metadata)
 
     def reset(self, envs_idx=None):
         if not self._sensors_by_type:

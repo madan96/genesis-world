@@ -229,6 +229,19 @@ class ProbeSensorMixin(Generic[ProbeSensorSharedMetadataT]):
         self._shared_metadata.cache_col_n_channel_groups.append(self._taxel_channel_groups)
 
     @classmethod
+    def state_tensors(cls, shared_metadata):
+        yield from super().state_tensors(shared_metadata)
+        yield "probe_gains", shared_metadata.probe_gains
+        yield "dead_taxel_mask", shared_metadata.dead_taxel_mask
+        yield "dead_taxel_values", shared_metadata.dead_taxel_values
+
+    @classmethod
+    def state_restored(cls, shared_metadata) -> None:
+        super().state_restored(shared_metadata)
+        shared_metadata.has_any_probe_gain = bool((shared_metadata.probe_gains != 1.0).any())
+        shared_metadata.dead_dirty = True
+
+    @classmethod
     def reset(cls, shared_metadata, shared_ground_truth_cache, envs_idx):
         super().reset(shared_metadata, shared_ground_truth_cache, envs_idx)
         # Resample per-(env, probe) gain for probes whose sensor configured a resample range.

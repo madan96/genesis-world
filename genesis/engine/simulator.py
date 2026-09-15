@@ -244,7 +244,7 @@ class Simulator(RBC):
     def destroy(self):
         self._sensor_manager.destroy()
 
-    def reset(self, state: SimState, envs_idx=None):
+    def reset(self, state: SimState, envs_idx=None, *, restore_sensor_state: bool = True):
         for solver, solver_state in zip(self._solvers, state):
             if solver.n_entities > 0:
                 solver.set_state(0, solver_state, envs_idx)
@@ -253,9 +253,9 @@ class Simulator(RBC):
             self._steps.zero_()
         else:
             self._steps[indices_to_mask(envs_idx)] = 0
-        self._restart(envs_idx)
+        self._restart(envs_idx, sensor_state=state.sensor_state if restore_sensor_state else None)
 
-    def _restart(self, envs_idx=None):
+    def _restart(self, envs_idx=None, *, sensor_state=None):
         """Restart the coupler, the gradient tape and the sensors."""
         self._coupler.reset(envs_idx=envs_idx)
         for binding in self.mpm_solver._hybrid_bindings:
@@ -267,7 +267,10 @@ class Simulator(RBC):
         self._cur_substep_global = 0
 
         # reset sensors state
-        self._sensor_manager.reset(envs_idx=envs_idx)
+        if sensor_state is None:
+            self._sensor_manager.reset(envs_idx=envs_idx)
+        else:
+            self._sensor_manager.set_state(sensor_state, envs_idx=envs_idx)
 
     def data(self, kinds: frozenset[DataKind]) -> Iterator[DataItem]:
         """Yield every item of the given kinds the active solvers hold, each under the class name of its solver."""

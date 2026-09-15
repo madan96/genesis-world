@@ -239,7 +239,7 @@ class Sensor(RBC, Generic[OptionsT, SharedSensorContextT, SharedSensorMetadataT,
         # prototyping (and so it can be dropped from the signature later).
         self._manager: "SensorManager" = manager
         # The cross-type shared context instance, or ``None`` when this sensor type declares no context. Reachable from
-        # instance methods (build / debug); the per-step classmethod hooks receive it as the ``shared_context`` argument.
+        # instance methods (build / debug); per-step classmethod hooks receive it as ``shared_context``.
         self._shared_context: SharedSensorContextT = shared_context
         self._shared_metadata: SharedSensorMetadataT = shared_metadata
         self._is_built = False
@@ -323,6 +323,21 @@ class Sensor(RBC, Generic[OptionsT, SharedSensorContextT, SharedSensorMetadataT,
             The indices of the environments to reset. The envs_idx should already be sanitized by SensorManager.
         """
         pass
+
+    @classmethod
+    def state_tensors(cls, shared_metadata: SharedSensorMetadataT):
+        """Yield persistent tensors with a leading environment axis for scene snapshots.
+
+        Stateful subclasses extend this iterator and keep names/shapes stable after build. Derived caches can be
+        rebuilt by ``state_restored`` after all selected rows have been copied back.
+        """
+        if shared_metadata.jitter_ts.shape[0] > 0:
+            yield "jitter", shared_metadata.jitter_ts
+
+    @classmethod
+    def state_restored(cls, shared_metadata: SharedSensorMetadataT) -> None:
+        """Refresh derived state after persistent tensors have been restored."""
+        shared_metadata.has_any_jitter = bool((shared_metadata.jitter_ts > gs.EPS).any())
 
     def _get_return_format(self) -> tuple[int | tuple[int, ...], ...]:
         """
@@ -544,7 +559,9 @@ class Sensor(RBC, Generic[OptionsT, SharedSensorContextT, SharedSensorMetadataT,
             # per sensor field structure
             index_slice = field_start
 
-        field[:, index_slice] = broadcast_tensor(value, field.dtype, (len(envs_idx), field_size), ("envs_idx", ""))
+        field[envs_idx, index_slice] = broadcast_tensor(
+            value, field.dtype, (len(envs_idx), field_size), ("envs_idx", "")
+        )
 
 
 class _SolverLinkGroup(NamedTuple):
@@ -601,6 +618,12 @@ class _LinkAttachedSensorMixin:
     """
 
     _link: "RigidLink | None" = None
+
+    @classmethod
+    def state_tensors(cls, shared_metadata):
+        yield from super().state_tensors(shared_metadata)
+        yield "offsets_pos", shared_metadata.offsets_pos
+        yield "offsets_quat", shared_metadata.offsets_quat
 
     def build(self):
         super().build()
@@ -707,6 +730,23 @@ class SimpleSensor(Sensor[OptionsT, SharedSensorContextT, SharedSensorMetadataT,
 
     uses_ring_pipeline: ClassVar[bool] = True
 
+    @classmethod
+    def state_tensors(cls, shared_metadata):
+        yield from super().state_tensors(shared_metadata)
+        yield "resolution", shared_metadata.resolution
+        yield "bias", shared_metadata.bias
+        yield "random_walk", shared_metadata.random_walk
+        yield "drift_state", shared_metadata._cur_random_walk
+        yield "noise", shared_metadata.noise
+
+    @classmethod
+    def state_restored(cls, shared_metadata) -> None:
+        super().state_restored(shared_metadata)
+        shared_metadata.has_any_resolution = bool((shared_metadata.resolution > gs.EPS).any())
+        shared_metadata.has_any_bias = bool((shared_metadata.bias != 0.0).any())
+        shared_metadata.has_any_random_walk = bool((shared_metadata.random_walk > gs.EPS).any())
+        shared_metadata.has_any_noise = bool((shared_metadata.noise > gs.EPS).any())
+
     @gs.assert_built
     def set_resolution(self, resolution, envs_idx=None):
         self._set_metadata_field(
@@ -789,7 +829,7 @@ class SimpleSensor(Sensor[OptionsT, SharedSensorContextT, SharedSensorMetadataT,
             self._shared_metadata.noise, to_tuple(self._options.noise), expand=(batch_size, -1), dim=-1
         )
         self._shared_metadata.jitter_ts = concat_with_tensor(
-            self._shared_metadata.jitter_ts, to_tuple(self._options.jitter / self._dt), expand=(batch_size, -1), dim=-1
+            self._shared_metadata.jitter_ts, self._options.jitter / self._dt, expand=(batch_size, 1), dim=1
         )
         if np.any(jitter_np > gs.EPS):
             self._shared_metadata.has_any_jitter = True
@@ -805,7 +845,7 @@ class SimpleSensor(Sensor[OptionsT, SharedSensorContextT, SharedSensorMetadataT,
     @classmethod
     def reset(cls, shared_metadata: SharedSensorMetadata, shared_ground_truth_cache: torch.Tensor, envs_idx):
         super().reset(shared_metadata, shared_ground_truth_cache, envs_idx)
-        shared_metadata._cur_random_walk[envs_idx, ...].fill_(0.0)
+        shared_metadata._cur_random_walk[envs_idx, ...] = 0.0
 
     @classmethod
     def _update_shared_cache(

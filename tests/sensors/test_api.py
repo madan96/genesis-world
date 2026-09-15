@@ -13,6 +13,80 @@ from ..utils.assertions import assert_allclose, assert_equal
 
 
 @pytest.mark.required
+def test_selected_sensor_parameters(show_viewer):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            gravity=(0, 0, 0),
+        ),
+        show_viewer=show_viewer,
+    )
+    entity = scene.add_entity(
+        morph=gs.morphs.Sphere(
+            radius=0.1,
+        ),
+    )
+    sensors = [
+        scene.add_sensor(
+            gs.sensors.IMU(
+                entity_idx=entity.idx,
+                magnetic_field=(1, 0, 0),
+            )
+        )
+        for _ in range(2)
+    ]
+    scene.build(n_envs=2)
+    sensors[0].set_bias([1, 2, 3, 0, 0, 0, 0, 0, 0], envs_idx=[0])
+    sensors[1].set_bias([-1, -2, -3, 0, 0, 0, 0, 0, 0], envs_idx=[1])
+    sensors[0].set_quat_offset([np.sqrt(0.5), 0, 0, np.sqrt(0.5)], envs_idx=[0])
+    sensors[1].set_quat_offset([0, 0, 0, 1], envs_idx=[1])
+    scene.step()
+    observed = torch.stack([torch.cat((sensor.read().lin_acc, sensor.read().mag), dim=-1) for sensor in sensors])
+    expected = [
+        [[1, 2, 3, 0, -1, 0], [0, 0, 0, 1, 0, 0]],
+        [[0, 0, 0, 1, 0, 0], [-1, -2, -3, -1, 0, 0]],
+    ]
+    assert_allclose(observed, expected, atol=1e-6)
+
+
+@pytest.mark.required
+def test_selected_random_walk_reset(show_viewer):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            gravity=(0, 0, 0),
+        ),
+        show_viewer=show_viewer,
+    )
+    entity = scene.add_entity(
+        morph=gs.morphs.Sphere(
+            radius=0.1,
+        ),
+    )
+    sensor = scene.add_sensor(
+        gs.sensors.IMU(
+            entity_idx=entity.idx,
+            acc_random_walk=(0.2, 0.3, 0.4),
+        )
+    )
+    scene.add_sensor(
+        gs.sensors.IMU(
+            entity_idx=entity.idx,
+            acc_random_walk=(0.5, 0.6, 0.7),
+        )
+    )
+    scene.build(n_envs=2)
+    for _ in range(4):
+        scene.step()
+    before = sensor.read().lin_acc.clone()
+    assert (torch.linalg.norm(before, dim=-1) > 0.01).all()
+    # The other sensor keeps the shared random-walk pipeline active while this sensor's accumulated drift is frozen.
+    sensor.set_random_walk(0)
+    scene.reset(envs_idx=[0])
+    scene.step()
+    assert_allclose(sensor.read(envs_idx=[0]).lin_acc, 0, atol=1e-7)
+    assert_allclose(sensor.read(envs_idx=[1]).lin_acc, before[1:2], atol=1e-7)
+
+
+@pytest.mark.required
 def test_lazy_sensor_discovery(show_viewer, tmp_path):
     from genesis.engine.sensors.camera import RasterizerCameraSensor
     from genesis.engine.sensors.contact_force import ContactSensor

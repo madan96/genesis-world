@@ -2204,6 +2204,14 @@ class ElastomerTaxelSensor(
         shared_metadata.surface_initialized_buf[envs_idx, :] = False
 
     @classmethod
+    def state_tensors(cls, shared_metadata: ElastomerTaxelSensorMetadata):
+        yield from super().state_tensors(shared_metadata)
+        yield "surface_initialized", shared_metadata.surface_initialized_buf
+        yield "surface_entry_pos_sensor", shared_metadata.surface_entry_pos_sensor_buf
+        yield "surface_pos_sensor", shared_metadata.surface_pos_sensor_buf
+        yield "surface_depth", shared_metadata.surface_depth_buf
+
+    @classmethod
     def _apply_transform(
         cls,
         shared_metadata: ElastomerTaxelSensorMetadata,

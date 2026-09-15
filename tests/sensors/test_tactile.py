@@ -634,6 +634,22 @@ def test_contact_depth_probe_hysteresis_gain_and_dead_resample(show_viewer, tol)
     assert not torch.allclose(gains_a, gains_b, atol=1e-3)
     assert not torch.allclose(dead_a, dead_b, atol=1e-3)
 
+    snapshot = scene.get_state()
+    saved = tuple(sensor.read() for sensor in (hyst_sensor, gain_sensor, dead_sensor))
+    continuation = []
+    for _ in range(3):
+        step_at(BOX_Z_ON)
+        continuation.append(tuple(sensor.read() for sensor in (hyst_sensor, gain_sensor, dead_sensor)))
+    before_restore = tuple(sensor.read() for sensor in (hyst_sensor, gain_sensor, dead_sensor))
+    scene.reset(snapshot, envs_idx=[0])
+    for sensor, initial, current in zip((hyst_sensor, gain_sensor, dead_sensor), saved, before_restore):
+        assert_equal(sensor.read(envs_idx=[0]), initial[0:1])
+        assert_equal(sensor.read(envs_idx=slice(1, None)), current[1:])
+    for expected in continuation:
+        step_at(BOX_Z_ON)
+        for sensor, value in zip((hyst_sensor, gain_sensor, dead_sensor), expected):
+            assert_allclose(sensor.read(envs_idx=[0]), value[0:1], tol=tol)
+
 
 @pytest.mark.slow  # ~200s
 @pytest.mark.required
@@ -1479,9 +1495,26 @@ def test_elastomer_sensor_sphere_ground_dilate_shear(show_viewer, tol, n_envs):
     assert_allclose(shear_normal_projection, 0.0, tol=tol)
     assert_allclose(combined_data, dilate_data + shear_data, tol=5e-5)
 
+    snapshot = scene.get_state()
+    sphere.set_pos((2 * LATERAL_SHIFT, 0.0, sphere_init_pos[2]))
+    scene.step()
+    continuation = shear_sensor.read_ground_truth()
+
     sphere.set_pos((0.0, 0.0, SPHERE_RADIUS + 0.05))
     scene.step()
     assert_equal(combined_sensor.read_ground_truth(), 0.0, err_msg="ElastomerTaxel should be zero with no contact.")
+    selected = [0] if n_envs else None
+    scene.reset(snapshot, envs_idx=selected)
+    assert_equal(shear_sensor.read_ground_truth(envs_idx=selected), shear_data[0:1] if n_envs else shear_data)
+    if n_envs:
+        assert_equal(shear_sensor.read_ground_truth(envs_idx=[1]), 0)
+    sphere.set_pos((2 * LATERAL_SHIFT, 0.0, sphere_init_pos[2]), envs_idx=selected)
+    scene.step()
+    assert_allclose(
+        shear_sensor.read_ground_truth(envs_idx=selected), continuation[0:1] if n_envs else continuation, tol=tol
+    )
+    if n_envs:
+        assert_equal(shear_sensor.read_ground_truth(envs_idx=[1]), 0)
 
 
 @pytest.mark.required

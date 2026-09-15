@@ -974,6 +974,9 @@ class Scene(RBC):
         state : SimState | None
             The state to reset the scene to. If None, the scene will be reset to its initial state.
             If this is given, the scene's registerered initial state will be updated to this state.
+            An explicit state restores captured sensor histories and electronics for the selected environments.
+            With None, sensor histories clear and configured hardware randomization is resampled. Future random
+            draws use the caller-controlled torch RNG; restoring a state does not rewind that shared RNG.
         envs_idx : None | array_like, optional
             The indices of the environments. If None, all environments will be considered. Defaults to None.
         """
@@ -987,6 +990,7 @@ class Scene(RBC):
 
     def _reset(self, state: SimState | None = None, *, envs_idx=None, keep_init: bool = False):
         if self._is_built:
+            restore_sensor_state = state is not None
             if state is None:
                 state = self._init_state
             else:
@@ -995,7 +999,7 @@ class Scene(RBC):
                 # reset() still rewinds to the true initial state.
                 if not keep_init:
                     self._init_state = state
-            self._sim.reset(state, envs_idx)
+            self._sim.reset(state, envs_idx, restore_sensor_state=restore_sensor_state)
         else:
             self._init_state = self._get_state()
         self._restart()

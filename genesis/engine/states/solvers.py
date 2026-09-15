@@ -79,6 +79,7 @@ class SimState(RBC):
     ):
         self._scene = scene
         self._s_global = s_global
+        self._sensor_state = scene.sim._sensor_manager.get_state()
         self._solvers_state = list()
         for solver in solvers:
             self._solvers_state.append(solver.get_state(f_local))
@@ -94,6 +95,11 @@ class SimState(RBC):
     @property
     def solvers_state(self):
         return self._solvers_state
+
+    @property
+    def sensor_state(self):
+        """Owned electronics and sensor histories; future random draws use the caller-controlled torch RNG."""
+        return self._sensor_state
 
     def __iter__(self):
         return iter(self._solvers_state)

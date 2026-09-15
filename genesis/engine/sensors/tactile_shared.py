@@ -616,6 +616,32 @@ class ViscoelasticHysteresisMixin(Generic[ViscoelasticHysteresisSharedMetadataT]
         self._shared_metadata.viscoelastic_alpha_row = torch.empty((0,), dtype=gs.tc_float, device=gs.device)
 
     @classmethod
+    def state_tensors(cls, shared_metadata):
+        yield from super().state_tensors(shared_metadata)
+        if shared_metadata.has_any_hysteresis:
+            cls._initialize_viscoelastic_state(
+                shared_metadata,
+                shared_metadata.delays_ts.shape[0],
+                sum(shared_metadata.cache_sizes),
+                shared_metadata.hysteresis_strength.dtype,
+            )
+            yield "viscoelastic_xi", shared_metadata.viscoelastic_xi
+            yield "viscoelastic_previous_input", shared_metadata.viscoelastic_prev_input
+
+    @classmethod
+    def _initialize_viscoelastic_state(cls, shared_metadata, batch_size, n_cols, dtype):
+        if shared_metadata.viscoelastic_strength_row.shape == (n_cols,):
+            return
+        sensor_col_idx = []
+        for i_s, size in enumerate(shared_metadata.cache_sizes):
+            sensor_col_idx.extend([i_s] * size)
+        idx_t = torch.tensor(sensor_col_idx, dtype=torch.long, device=gs.device)
+        shared_metadata.viscoelastic_strength_row = shared_metadata.hysteresis_strength[idx_t].to(dtype=dtype)
+        shared_metadata.viscoelastic_alpha_row = shared_metadata.hysteresis_alpha[idx_t].to(dtype=dtype)
+        shared_metadata.viscoelastic_xi = torch.zeros((batch_size, n_cols), dtype=dtype, device=gs.device)
+        shared_metadata.viscoelastic_prev_input = torch.zeros((batch_size, n_cols), dtype=dtype, device=gs.device)
+
+    @classmethod
     def reset(
         cls, shared_metadata: ViscoelasticHysteresisSharedMetadataT, shared_ground_truth_cache: torch.Tensor, envs_idx
     ):
@@ -638,16 +664,7 @@ class ViscoelasticHysteresisMixin(Generic[ViscoelasticHysteresisSharedMetadataT]
             return
 
         B, n_cols, *_ = data.shape
-        # Lazily build the per-cache-column strength/alpha rows and state buffers
-        if shared_metadata.viscoelastic_strength_row.shape != (n_cols,):
-            sensor_col_idx = []
-            for i_s, size in enumerate(shared_metadata.cache_sizes):
-                sensor_col_idx.extend([i_s] * size)
-            idx_t = torch.tensor(sensor_col_idx, dtype=torch.long, device=gs.device)
-            shared_metadata.viscoelastic_strength_row = shared_metadata.hysteresis_strength[idx_t].to(dtype=data.dtype)
-            shared_metadata.viscoelastic_alpha_row = shared_metadata.hysteresis_alpha[idx_t].to(dtype=data.dtype)
-            shared_metadata.viscoelastic_xi = torch.zeros((B, n_cols), dtype=data.dtype, device=gs.device)
-            shared_metadata.viscoelastic_prev_input = torch.zeros((B, n_cols), dtype=data.dtype, device=gs.device)
+        cls._initialize_viscoelastic_state(shared_metadata, B, n_cols, data.dtype)
 
         xi = shared_metadata.viscoelastic_xi
         prev = shared_metadata.viscoelastic_prev_input
