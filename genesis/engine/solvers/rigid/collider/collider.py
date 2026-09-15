@@ -300,7 +300,9 @@ class Collider:
         )
 
         # 'contact_data_cache' is not used in Quadrants kernels, so keep it outside of the collider state / info
-        self._contact_data_cache: dict[tuple[bool, bool], dict[str, torch.Tensor | tuple[torch.Tensor]]] = {}
+        self._contact_data_cache: dict[
+            tuple[bool, bool, bool, bool], dict[str, torch.Tensor | tuple[torch.Tensor]]
+        ] = {}
 
         # GPU core count (used by split-narrowphase chunking + the cooperative dedup dispatch gate).
         # FIXME: Quadrants should expose a unified API to query GPU core count across all backends.
@@ -1014,7 +1016,7 @@ class Collider:
         self, as_tensor: bool = True, to_torch: bool = True, keep_batch_dim: bool = False, is_padded: bool = False
     ):
         # Early return if already pre-computed
-        contact_data = self._contact_data_cache.setdefault((as_tensor, to_torch, is_padded), {})
+        contact_data = self._contact_data_cache.setdefault((as_tensor, to_torch, keep_batch_dim, is_padded), {})
         if contact_data:
             return contact_data.copy()
 
