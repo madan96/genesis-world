@@ -95,6 +95,9 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
             lower=self._lower_bound + self.boundary_padding, upper=self._upper_bound - self.boundary_padding
         )
 
+    def register_hybrid_binding(self, binding):
+        self._hybrid_bindings.append(binding)
+
     def init_particle_fields(self):
         # dynamic particle state
         struct_particle_state = qd.types.struct(
@@ -702,6 +705,8 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
             self.sim.coupler.rigid_solver.dyn_state.links,
             self.sim.coupler.rigid_solver.rigid_info,
         )
+        for binding in self._hybrid_bindings:
+            binding.apply_attachment(f + 1, phase="after_coupling")
 
         # Apply particle constraints after g2p
         if self._constraints_initialized:

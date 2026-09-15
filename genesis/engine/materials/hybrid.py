@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING, Callable
 
 from pydantic import StrictBool
 
+from genesis.options.hybrid import HybridBindingOptions, HybridCollisionOptions, HybridMassOptions, HybridSkinOptions
 from genesis.typing import NonNegativeFloat, ValidFloat
 
 from .base import Material
@@ -38,10 +39,22 @@ class Hybrid(Material["HybridEntity"]):
 
     material_rigid: Material = ...
     material_soft: Material = ...
+    material_soft_palette: tuple[Material, ...] = ()
     use_default_coupling: StrictBool = False
     damping: NonNegativeFloat = 0.0
     thickness: ValidFloat = 0.05
     soft_dv_coef: ValidFloat = 0.01
+    skin: HybridSkinOptions | None = None
+    binding: HybridBindingOptions | None = None
+    mass: HybridMassOptions | None = None
+    collision: HybridCollisionOptions | None = None
     func_instantiate_rigid_from_soft: Callable | None = None
     func_instantiate_soft_from_rigid: Callable | None = None
     func_instantiate_rigid_soft_association: Callable | None = None
+
+    @property
+    def is_explicit(self) -> bool:
+        """Whether typed skin, binding, mass or collision options select the continuous skin path."""
+        return bool(self.material_soft_palette) or any(
+            option is not None for option in (self.skin, self.binding, self.mass, self.collision)
+        )

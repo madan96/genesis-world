@@ -10,6 +10,7 @@ import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
 import genesis.utils.urdf as uu
 from genesis.ext.urdfpy.urdf import URDF
+from genesis.engine.hybrid_binding import HybridBinding
 
 from genesis.utils.hybrid import (
     check_graph,
@@ -53,6 +54,17 @@ class HybridEntity(Entity):
 
     def __init__(self, idx, scene, material, morph, surface, name: str | None = None):
         super().__init__(idx, scene, morph, None, material, surface, name=name)
+        self._skin_binding = None
+        if material.is_explicit:
+            self._skin_binding = HybridBinding(self, scene, material, morph, surface)
+            self._part_rigid = self._skin_binding.part_rigid
+            self._part_soft = self._skin_binding.part_soft
+            self._solver_rigid = self._part_rigid.solver
+            self._solver_soft = self._part_soft.solver
+            self._material_rigid = self._part_rigid.material
+            self._material_soft = self._part_soft.material
+            self._idx = scene.sim.n_entities
+            return
 
         material_rigid = material.material_rigid
         material_soft = material.material_soft
@@ -368,6 +380,9 @@ class HybridEntity(Entity):
         """
         Finalize the hybrid entity setup during simulation build.
         """
+        if self._skin_binding is not None:
+            self._skin_binding.build()
+            return
         # can only be called here (at sim build)
         if not self.material.use_default_coupling and self._muscle_group_cache is not None:
             self._part_soft.set_muscle(
@@ -453,6 +468,42 @@ class HybridEntity(Entity):
     # ------------------------------------------------------------------------------------
     # ----------------------------------- properties -------------------------------------
     # ------------------------------------------------------------------------------------
+
+    @property
+    def is_built(self):
+        return self.scene.is_built
+
+    @property
+    def is_explicit(self):
+        return self._skin_binding is not None
+
+    @property
+    def region_names(self):
+        return list(self._skin_binding.region_names) if self._skin_binding is not None else []
+
+    @gs.assert_built
+    def get_mass_breakdown(self):
+        """Return owned batched mass and world center-of-mass tensors for continuous skin."""
+        return self._skin_binding.get_mass_breakdown()
+
+    @gs.assert_built
+    def get_binding_diagnostics(self):
+        """Return owned binding tensors and per-environment attachment impulse and energy diagnostics."""
+        return self._skin_binding.get_binding_diagnostics()
+
+    @gs.assert_built
+    def get_attachment_link_wrench(self):
+        """Return step-mean world force and torque about the world origin, shaped [B, links, 3]."""
+        return self._skin_binding.get_attachment_link_wrench()
+
+    @gs.assert_built
+    def set_attachment_params(self, timeconst=None, damping_ratio=None, envs_idx=None):
+        """Set positive attachment time constants and nonnegative damping ratios for selected environments."""
+        self._skin_binding.set_attachment_params(timeconst, damping_ratio, envs_idx)
+
+    def configure_passive_joints(self, dofs_idx_local=None, friction_vel_eps=0.05):
+        """Configure passive joint mechanics on the rigid articulation."""
+        return self.part_rigid.configure_passive_joints(dofs_idx_local, friction_vel_eps)
 
     @property
     def n_dofs(self) -> int:

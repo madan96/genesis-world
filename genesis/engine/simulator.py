@@ -138,6 +138,7 @@ class Simulator(RBC):
         if isinstance(material, gs.materials.Hybrid):
             # Note that adding to solver is handled in the hybrid entity
             entity = HybridEntity(self.n_entities, self.scene, material, morph, surface, name=name)
+            entity._idx = self.n_entities
         else:
             # Several solvers may declare a class the material belongs to, since 'Rigid' derives from 'Kinematic'. The
             # one declaring the most derived class simulates it (see 'Solver.material_cls').
@@ -257,6 +258,8 @@ class Simulator(RBC):
     def _restart(self, envs_idx=None):
         """Restart the coupler, the gradient tape and the sensors."""
         self._coupler.reset(envs_idx=envs_idx)
+        for binding in self.mpm_solver._hybrid_bindings:
+            binding.reset(self.scene._sanitize_envs_idx(envs_idx))
 
         # TODO: keeping as is for now
         self.reset_grad()

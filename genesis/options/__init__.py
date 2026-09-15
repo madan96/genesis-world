@@ -19,6 +19,10 @@ from .solvers import (
 from .vis import ViewerOptions, VisOptions
 
 __all__ = [
+    "HybridBindingOptions",
+    "HybridCollisionOptions",
+    "HybridMassOptions",
+    "HybridSkinOptions",
     "KinematicOptions",
     "BaseCouplerOptions",
     "CoacdOptions",
@@ -39,3 +43,4 @@ __all__ = [
     "ViewerOptions",
     "VisOptions",
 ]
+from .hybrid import HybridBindingOptions, HybridCollisionOptions, HybridMassOptions, HybridSkinOptions

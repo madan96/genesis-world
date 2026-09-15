@@ -4,12 +4,179 @@ import sys
 import numpy as np
 import pytest
 import torch
+import trimesh
 
 import genesis as gs
 from genesis.utils.misc import tensor_to_array
 
 from ..utils.assertions import assert_allclose
 from ..utils.assets import get_hf_dataset
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("n_envs", [0, 2])
+@pytest.mark.parametrize("heterogeneous", [False, True])
+def test_continuous_skin_binding(n_envs, heterogeneous, tmp_path, tol):
+    urdf = tmp_path / "articulation.urdf"
+    urdf.write_text("""<robot name="articulation">
+      <link name="base"><inertial><mass value="2"/><inertia ixx="0.1" iyy="0.1" izz="0.1" ixy="0" ixz="0" iyz="0"/></inertial>
+        <collision><geometry><box size="0.08 0.08 0.08"/></geometry></collision></link>
+      <link name="tip"><inertial><mass value="2"/><inertia ixx="0.1" iyy="0.1" izz="0.1" ixy="0" ixz="0" iyz="0"/></inertial>
+        <collision><geometry><box size="0.08 0.08 0.08"/></geometry></collision></link>
+      <joint name="hinge" type="revolute"><parent link="base"/><child link="tip"/><origin xyz="0.2 0 0"/>
+        <axis xyz="0 0 1"/><limit lower="-1" upper="1" effort="100" velocity="10"/></joint>
+    </robot>""")
+    surface = trimesh.creation.box(extents=(0.3, 0.08, 0.08))
+    surface.apply_translation((0.1, 0.0, 0.0))
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=1e-4, substeps=1, gravity=(0.0, 0.0, 0.0)),
+        rigid_options=gs.options.RigidOptions(integrator=gs.integrator.Euler),
+        mpm_options=gs.options.MPMOptions(
+            lower_bound=(-0.5, -0.5, -0.5),
+            upper_bound=(0.5, 0.5, 0.5),
+            grid_density=32,
+            particle_size=0.02,
+        ),
+        show_viewer=False,
+    )
+    human = scene.add_entity(
+        morph=gs.morphs.URDF(file=str(urdf), fixed=False, default_armature=0.0),
+        material=gs.materials.Hybrid(
+            material_rigid=gs.materials.Rigid(),
+            material_soft=gs.materials.MPM.Elastic(E=1000.0, nu=0.2, rho=1000.0, model="neohooken"),
+            material_soft_palette=(gs.materials.MPM.Elastic(E=2000.0, nu=0.2, rho=2000.0, model="neohooken"),)
+            if heterogeneous
+            else (),
+            skin=gs.options.HybridSkinOptions(
+                surface=surface,
+                vertex_material_id=(surface.vertices[:, 0] > 0.1).astype(gs.np_int) if heterogeneous else None,
+                vertex_surface_contact=surface.vertices[:, 0] <= 0.1 if heterogeneous else None,
+                skinning={
+                    "link_names": ["base", "tip"],
+                    "indices": np.tile([0, 1], (len(surface.vertices), 1)),
+                    "weights": np.tile([0.25, 0.75], (len(surface.vertices), 1)),
+                },
+            ),
+            binding=gs.options.HybridBindingOptions(timeconst=0.01, damping_ratio=0.0),
+            mass=gs.options.HybridMassOptions(mode="split_total", total_mass=5.0, soft_mass_fraction=0.2),
+        ),
+    )
+    scene.build(n_envs=n_envs)
+    initial_state = scene.get_state()
+    mass = human.get_mass_breakdown()
+    assert_allclose(mass.total, 5.0, tol=1e-6)
+    assert_allclose(mass.rigid_total, 4.0, tol=1e-6)
+    assert_allclose(mass.soft_total, 1.0, tol=1e-6)
+    assert_allclose(mass.soft_mass_by_weighted_link, (0.25, 0.75), tol=1e-6)
+    binding = human.get_binding_diagnostics()
+    assert_allclose(binding["weights"][:, :2], (0.75, 0.25), tol=1e-6)
+    assert_allclose(binding["weights"].sum(dim=-1), 1.0, tol=1e-6)
+    assert (binding["active_count"] == 2).all()
+    if heterogeneous:
+        assert set(binding["material_id"].tolist()) == {0, 1}
+        assert_allclose(
+            binding["particle_mass"][binding["material_id"] == 1].mean(),
+            2.0 * binding["particle_mass"][binding["material_id"] == 0].mean(),
+            tol=1e-8,
+        )
+        assert torch.equal(binding["surface_contact"], binding["material_id"] == 0)
+    initial = human.part_soft.get_particles_pos().clone()
+    scene.step()
+    assert_allclose(human.part_soft.get_particles_pos(), initial, tol=1e-6)
+    assert_allclose(human.get_binding_diagnostics()["attach_pos_err_max"], 0.0, tol=1e-6)
+    velocity = torch.tensor((0.0, 0.05, 0.0), dtype=gs.tc_float, device=gs.device)
+    human.part_soft.set_particles_vel(velocity)
+    initial_linear_momentum = velocity * mass.soft_total[..., None]
+    initial_angular_momentum = (
+        torch.linalg.cross(initial, velocity.expand_as(initial)) * binding["particle_mass"][..., None]
+    ).sum(dim=-2)
+    scene.step()
+    diagnostics = human.get_binding_diagnostics()
+    force, torque = human.get_attachment_link_wrench()
+    assert_allclose(force.sum(dim=1) * scene.dt, -diagnostics["attach_impulse_sum"], tol=1e-8)
+    assert_allclose(torque.sum(dim=1) * scene.dt, -diagnostics["attach_ang_impulse_sum"], tol=1e-8)
+    soft_velocity = human.part_soft.get_particles_vel()
+    rigid_velocity = human.part_rigid.get_links_vel(ref=gs.link_ref_frame.link_COM)
+    rigid_position = human.part_rigid.get_links_pos(ref=gs.link_ref_frame.link_COM)
+    rigid_angular_velocity = human.part_rigid.get_links_ang()
+    if n_envs == 0:
+        rigid_velocity = rigid_velocity[None]
+        rigid_position = rigid_position[None]
+        rigid_angular_velocity = rigid_angular_velocity[None]
+    soft_momentum = (soft_velocity * binding["particle_mass"][..., None]).sum(dim=-2)
+    rigid_momentum = (rigid_velocity * mass.per_rigid_link[..., None]).sum(dim=-2)
+    assert_allclose(rigid_momentum + soft_momentum, initial_linear_momentum, tol=2e-7)
+    soft_angular_momentum = (
+        torch.linalg.cross(human.part_soft.get_particles_pos(), soft_velocity) * binding["particle_mass"][..., None]
+    ).sum(dim=-2)
+    # The authored inertias are 0.1 I and split_total leaves the rigid masses unchanged.
+    rigid_angular_momentum = (
+        0.1 * rigid_angular_velocity
+        + torch.linalg.cross(rigid_position, rigid_velocity * mass.per_rigid_link[..., None])
+    ).sum(dim=-2)
+    assert_allclose(rigid_angular_momentum + soft_angular_momentum, initial_angular_momentum, tol=2e-7)
+    snapshot = scene.get_state()
+    expected_soft_velocity = human.part_soft.get_particles_vel().clone()
+    human.set_attachment_params(timeconst=0.02, damping_ratio=0.5)
+    selection = [0] if n_envs else None
+    scene.reset(snapshot, envs_idx=selection)
+    state = scene.sim.mpm_solver.get_state(scene.sim.cur_substep_local)
+    assert_allclose(state.attachment_omega[0], 100.0, tol=1e-8)
+    assert_allclose(state.attachment_damping_ratio[0], 0.0, tol=1e-8)
+    if n_envs:
+        assert_allclose(state.attachment_omega[1], 50.0, tol=1e-8)
+        assert_allclose(state.attachment_damping_ratio[1], 0.5, tol=1e-8)
+    assert_allclose(human.part_soft.get_particles_vel(), expected_soft_velocity, tol=1e-8)
+    scene.reset(initial_state)
+    angle = 0.2
+    human.part_rigid.set_dofs_position(angle, dofs_idx_local=[6])
+    particles = tensor_to_array(initial[0] if n_envs else initial, dtype=np.float64)
+    particle_mass = tensor_to_array(binding["particle_mass"], dtype=np.float64)
+    tip_offset = np.array((0.2, 0.0, 0.0))
+    c, s = np.cos(angle), np.sin(angle)
+    rotation = np.array(((c, -s, 0.0), (s, c, 0.0), (0.0, 0.0, 1.0)))
+    tip_anchors = (particles - tip_offset) @ rotation.T + tip_offset
+    force_expected = particle_mass[:, None] * 0.75 * (tip_anchors - particles) / 0.01**2
+    scene.step()
+    force, torque = human.get_attachment_link_wrench()
+    assert_allclose(force[:, 0], (-0.25 * force_expected).sum(axis=0), tol=tol)
+    assert_allclose(force[:, 1], (-0.75 * force_expected).sum(axis=0), tol=tol)
+    assert_allclose(torque[:, 0], np.cross(particles, -0.25 * force_expected).sum(axis=0), tol=tol)
+    assert_allclose(torque[:, 1], np.cross(tip_anchors, -0.75 * force_expected).sum(axis=0), tol=tol)
+    diagnostics = human.get_binding_diagnostics()
+    assert_allclose(diagnostics["damping_work"], 0.0, atol=gs.EPS)
+    # Local stability bound at this pose: both links are free with 2 kg and isotropic inertia 0.1, the spring lever
+    # arm is the larger of the particle and anchor distances to the link center of mass, and damping is zero.
+    link_idx = tensor_to_array(binding["link_idx"])
+    weights = tensor_to_array(binding["weights"], dtype=np.float64)
+    is_tip = link_idx == human.part_rigid.links[1].idx
+    anchors = np.where(is_tip[..., None], tip_anchors[:, None], particles[:, None])
+    centers = np.where(is_tip[..., None], tip_offset, 0.0)
+    radius = np.maximum(
+        np.linalg.norm(particles[:, None] - centers, axis=-1), np.linalg.norm(anchors - centers, axis=-1)
+    )
+    link_soft_mass = np.where(
+        is_tip,
+        (particle_mass[:, None] * weights)[is_tip].sum(),
+        (particle_mass[:, None] * weights)[~is_tip & (link_idx >= 0)].sum(),
+    )
+    link_weighted_radius = np.where(
+        is_tip,
+        (particle_mass[:, None] * weights * radius)[is_tip].sum(),
+        (particle_mass[:, None] * weights * radius)[~is_tip & (link_idx >= 0)].sum(),
+    )
+    mobility = (weights * (link_soft_mass / 2.0 + radius * link_weighted_radius * np.sqrt(3.0) / 0.1)).sum(axis=-1)
+    assert_allclose(diagnostics["stability_index"], (1.0 + mobility.max()) * (scene.dt / 0.01) ** 2 / 2.0, tol=1e-6)
+    human.set_attachment_params(damping_ratio=1.0)
+    for _ in range(3):
+        scene.step()
+    assert (human.get_binding_diagnostics()["damping_work"] < 0.0).all()
+    with pytest.raises(gs.GenesisException, match="timeconst"):
+        human.set_attachment_params(timeconst=0.0)
+    human.set_attachment_params(timeconst=scene.dt)
+    with pytest.raises(gs.GenesisException, match="stability"):
+        for _ in range(gs.engine.simulator.RATE_CHECK_ERRNO):
+            scene.step()
 
 
 @pytest.mark.slow  # ~300s
