@@ -10,6 +10,57 @@ from genesis.utils.misc import get_assets_dir
 
 
 @pytest.fixture
+def articulated_variants():
+    models = []
+    for length, angle in ((0.2, 0.0), (0.4, 90.0)):
+        mjcf = ET.Element("mujoco")
+        worldbody = ET.SubElement(mjcf, "worldbody")
+        base = ET.SubElement(worldbody, "body", name="base")
+        ET.SubElement(base, "geom", type="sphere", size="0.02", mass="1")
+        arm = ET.SubElement(base, "body", name="arm", pos="0 0 0.4")
+        ET.SubElement(arm, "joint", name="hinge", type="hinge", axis="0 1 0")
+        ET.SubElement(arm, "geom", type="sphere", size="0.04", mass="1")
+        tip = ET.SubElement(arm, "body", name="tip", pos=f"{length} 0 0", euler=f"0 0 {angle}")
+        ET.SubElement(tip, "geom", type="sphere", size="0.03", mass="2")
+        models.append(ET.tostring(mjcf, encoding="unicode"))
+    return tuple(models)
+
+
+@pytest.fixture
+def fixed_child_variants(articulated_variants):
+    models = []
+    for model in articulated_variants:
+        mjcf = ET.fromstring(model)
+        base = mjcf.find("worldbody/body")
+        ET.SubElement(base, "freejoint")
+        arm = base.find("body")
+        arm.remove(arm.find("joint"))
+        models.append(ET.tostring(mjcf, encoding="unicode"))
+    return tuple(models)
+
+
+@pytest.fixture
+def inconsistent_articulated_variants(articulated_variants):
+    models = []
+    for name, values in (
+        ("dofs_motion_ang", {"axis": "1 0 0"}),
+        ("pos", {"pos": "0.1 0 0"}),
+        ("dofs_limit", {"limited": "true", "range": "-30 30"}),
+    ):
+        mjcf = ET.fromstring(articulated_variants[1])
+        mjcf.find("worldbody/body/body/joint").attrib.update(values)
+        models.append((name, ET.tostring(mjcf, encoding="unicode")))
+    mjcf = ET.fromstring(articulated_variants[1])
+    base = mjcf.find("worldbody/body")
+    arm = base.find("body")
+    tip = arm.find("body")
+    arm.remove(tip)
+    base.append(tip)
+    models.append(("different parent", ET.tostring(mjcf, encoding="unicode")))
+    return tuple(models)
+
+
+@pytest.fixture
 def xml_path(request, tmp_path, model_name):
     """The model Mujoco is built from, which holds every subtree, however Genesis groups them into entities."""
     # An asset-relative path passes through to the asset resolver; a bare name is the fixture generating the model.

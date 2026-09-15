@@ -11,6 +11,100 @@ from ..utils.assets import get_hf_dataset
 
 
 @pytest.mark.required
+def test_articulated_variant_anchors(articulated_variants, show_viewer, tol):
+    DT = 0.001
+    GRAVITY = 9.81
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=DT,
+            gravity=(0.0, 0.0, -GRAVITY),
+        ),
+        rigid_options=gs.options.RigidOptions(
+            integrator=gs.integrator.Euler,
+        ),
+        show_viewer=show_viewer,
+    )
+    entity = scene.add_entity(
+        morph=tuple(gs.morphs.MJCF(file=model) for model in articulated_variants),
+        surface=gs.surfaces.Default(
+            vis_mode="collision",
+        ),
+    )
+    ghost = scene.add_entity(
+        morph=tuple(gs.morphs.MJCF(file=model, pos=(0.0, 1.0, 0.0)) for model in articulated_variants),
+        material=gs.materials.Kinematic(),
+    )
+    scene.build(n_envs=2)
+    tip = entity.get_link("tip")
+    assert_allclose(tip.get_pos(), ((0.2, 0.0, 0.4), (0.4, 0.0, 0.4)), tol=tol)
+    assert_allclose(gu.quat_to_xyz(tip.get_quat()), ((0.0, 0.0, 0.0), (0.0, 0.0, np.pi / 2)), tol=tol)
+    ghost_tip = ghost.get_link("tip")
+    assert_allclose(ghost_tip.get_pos() - tip.get_pos(), (0.0, 1.0, 0.0), tol=tol)
+    assert_allclose(gu.quat_to_xyz(ghost_tip.get_quat()), gu.quat_to_xyz(tip.get_quat()), tol=tol)
+    scene.step()
+    length = torch.tensor((0.2, 0.4), device=gs.device, dtype=gs.tc_float)
+    inertia = 0.4 * 0.04**2 + 0.4 * 2 * 0.03**2 + 2 * length**2 + entity.get_dofs_armature()[..., 0]
+    acceleration = 2 * GRAVITY * length / inertia
+    assert_allclose(entity.get_dofs_velocity()[..., 0], acceleration * DT, tol=tol)
+    position_retained = tip.get_pos(envs_idx=[1])
+    scene.reset(envs_idx=[0])
+    assert_allclose(tip.get_pos(envs_idx=[0]), (0.2, 0.0, 0.4), tol=tol)
+    assert_allclose(tip.get_pos(envs_idx=[1]), position_retained, tol=tol)
+    assert_allclose(entity.get_dofs_velocity(envs_idx=[0]), 0.0, tol=tol)
+    entity.set_dofs_position(0.3)
+    ghost.set_dofs_position(0.3)
+    positions = torch.stack((length * np.cos(0.3), torch.zeros_like(length), 0.4 - length * np.sin(0.3)), dim=-1)
+    assert_allclose(tip.get_pos(), positions, tol=tol)
+    assert_allclose(ghost_tip.get_pos() - tip.get_pos(), (0.0, 1.0, 0.0), tol=tol)
+
+
+@pytest.mark.required
+def test_fixed_child_variant_anchors(fixed_child_variants, show_viewer, tol):
+    scene = gs.Scene(
+        show_viewer=show_viewer,
+    )
+    references = [
+        scene.add_entity(
+            morph=gs.morphs.MJCF(
+                file=model,
+                pos=(0.0, 2.0 * (i_model + 1), 0.0),
+                align=True,
+            ),
+            surface=gs.surfaces.Default(
+                vis_mode="collision",
+            ),
+        )
+        for i_model, model in enumerate(fixed_child_variants)
+    ]
+    entity = scene.add_entity(
+        morph=tuple(gs.morphs.MJCF(file=model, align=True) for model in fixed_child_variants),
+        surface=gs.surfaces.Default(
+            vis_mode="collision",
+        ),
+    )
+    scene.build(n_envs=2)
+    for relative in (True, False):
+        positions = torch.cat(
+            [reference.get_links_pos(envs_idx=[i], relative=relative) for i, reference in enumerate(references)]
+        )
+        quaternions = torch.cat(
+            [reference.get_links_quat(envs_idx=[i], relative=relative) for i, reference in enumerate(references)]
+        )
+        assert_allclose(
+            positions - entity.get_links_pos(relative=relative), (((0.0, 2.0, 0.0),), ((0.0, 4.0, 0.0),)), tol=tol
+        )
+        assert_allclose(gu.quat_to_xyz(entity.get_links_quat(relative=relative)), gu.quat_to_xyz(quaternions), tol=tol)
+    for entity_loaded in (*references, entity):
+        entity_loaded.apply_links_external_wrench(torque=(0.1, 0.2, 0.3), links_idx_local=0)
+    scene.step()
+    velocities = torch.cat([reference.get_links_vel(envs_idx=[i]) for i, reference in enumerate(references)])
+    angular_velocities = torch.cat([reference.get_links_ang(envs_idx=[i]) for i, reference in enumerate(references)])
+    assert (torch.linalg.vector_norm(angular_velocities, dim=-1) > 0.01).all()
+    assert_allclose(entity.get_links_vel(), velocities, tol=tol)
+    assert_allclose(entity.get_links_ang(), angular_velocities, tol=tol)
+
+
+@pytest.mark.required
 def test_physics_parity(show_viewer, tol):
     # Uses the fixed-child mesh objects from 'test_convexify' (offset center of mass, distinct mass) so the per-env
     # parity check exercises the inertia alignment, not just trivially-symmetric primitives.
@@ -297,7 +391,7 @@ def test_pick_heterogenous_objects(show_viewer):
 
 
 @pytest.mark.required
-def test_invalid_variant_specification_raises():
+def test_invalid_variant_specification_raises(articulated_variants, inconsistent_articulated_variants):
     # Restricting variants to a single family is what keeps the inertial parsed per variant aligned with the variant
     # index: only URDF and MJCF variants record one, so admitting a basic object among them would shift every
     # subsequent lookup onto the wrong variant.
@@ -306,6 +400,12 @@ def test_invalid_variant_specification_raises():
     )
 
     scene = gs.Scene(show_viewer=False)
+
+    for name, model in inconsistent_articulated_variants:
+        with pytest.raises(gs.GenesisException, match=name):
+            scene.add_entity(
+                morph=(gs.morphs.MJCF(file=articulated_variants[0]), gs.morphs.MJCF(file=model)),
+            )
 
     morphs_heterogeneous = (
         gs.morphs.Box(size=(1.0, 1.0, 1.0)),

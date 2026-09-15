@@ -377,6 +377,8 @@ def kernel_update_heterogeneous_links_vgeom(
     i_l: qd.i32,
     links_vgeom_start: qd.types.ndarray(),
     links_vgeom_end: qd.types.ndarray(),
+    links_pos: qd.types.ndarray(),
+    links_quat: qd.types.ndarray(),
     # Quadrants variables
     dyn_info: array_class.DynInfo,
 ):
@@ -386,6 +388,10 @@ def kernel_update_heterogeneous_links_vgeom(
     for i_b in range(_B):
         dyn_info.links.vgeom_start[i_l, i_b] = links_vgeom_start[i_b]
         dyn_info.links.vgeom_end[i_l, i_b] = links_vgeom_end[i_b]
+        for j in qd.static(range(3)):
+            dyn_info.links.pos[i_l, i_b][j] = links_pos[i_b, j]
+        for j in qd.static(range(4)):
+            dyn_info.links.quat[i_l, i_b][j] = links_quat[i_b, j]
 
 
 @qd.kernel(fastcache=True)
@@ -399,6 +405,8 @@ def kernel_update_heterogeneous_link_info(
     links_inertial_pos: qd.types.ndarray(),
     links_inertial_quat: qd.types.ndarray(),
     links_inertial_i: qd.types.ndarray(),
+    links_pos: qd.types.ndarray(),
+    links_quat: qd.types.ndarray(),
     # Quadrants variables
     dyn_info: array_class.DynInfo,
 ):
@@ -414,9 +422,11 @@ def kernel_update_heterogeneous_link_info(
 
         for j in qd.static(range(3)):
             dyn_info.links.inertial_pos[i_l, i_b][j] = links_inertial_pos[i_b, j]
+            dyn_info.links.pos[i_l, i_b][j] = links_pos[i_b, j]
 
         for j in qd.static(range(4)):
             dyn_info.links.inertial_quat[i_l, i_b][j] = links_inertial_quat[i_b, j]
+            dyn_info.links.quat[i_l, i_b][j] = links_quat[i_b, j]
 
         for j1, j2 in qd.static(qd.ndrange(3, 3)):
             dyn_info.links.inertial_i[i_l, i_b][j1, j2] = links_inertial_i[i_b, j1, j2]

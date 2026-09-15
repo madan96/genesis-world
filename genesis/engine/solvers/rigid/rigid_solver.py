@@ -805,10 +805,13 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         one, so the gate never leaves a scene that needs equilibration without it; its only error is to enable it for a
         scene that does not, at a small runtime cost.
         """
-        children = {}
+        children, links_desc = {}, {}
         for entity in self._entities:
             for link in entity.links:
                 children.setdefault(link.parent_idx, []).append(link)
+                links_desc[link.idx] = [link.desc] + [
+                    variant.links[link.idx - entity.link_start] for variant in entity.desc.variants[1:]
+                ]
 
         # Per entity, the smallest lower bound and the largest upper bound over its entries, per variant.
         entities_lower, entities_upper = [], []
@@ -829,6 +832,10 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             for link in entity.links:
                 if link.is_fixed:
                     continue
+                mass = np.array([desc.mass for desc in links_desc[link.idx]])
+                inertial_pos = np.array([desc.inertial_pos for desc in links_desc[link.idx]])
+                inertial_quat = np.array([desc.inertial_quat for desc in links_desc[link.idx]])
+                inertia = np.array([desc.inertia for desc in links_desc[link.idx]])
                 is_rotor = link in rotor_links
                 for joint in link.joints:
                     if joint.type == gs.JOINT_TYPE.FIXED:
@@ -839,18 +846,23 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                     # their own anchors.
                     is_sole_joint = len(link.joints) == 1
                     if is_sole_joint:
-                        dist_com = {link.idx: np.linalg.norm(link.desc.inertial_pos - anchor)}
+                        dist_com = {link.idx: np.linalg.norm(inertial_pos - anchor, axis=-1)}
                     else:
-                        dist_com = {link.idx: np.linalg.norm(anchor) + np.linalg.norm(link.desc.inertial_pos)}
+                        dist_com = {link.idx: np.linalg.norm(anchor) + np.linalg.norm(inertial_pos, axis=-1)}
                     dist_origin = {link.idx: np.linalg.norm(anchor)}
                     sub, stack = [], [link]
                     while stack:
                         cur = stack.pop()
                         sub.append(cur)
                         for child in children.get(cur.idx, []):
-                            hop = np.linalg.norm(child.desc.pos) + 2.0 * sum(
-                                np.linalg.norm(j.pos) for j in child.joints
+                            child_pos_norm = np.linalg.norm([desc.pos for desc in links_desc[child.idx]], axis=-1)
+                            child_com_norm = np.linalg.norm(
+                                [desc.inertial_pos for desc in links_desc[child.idx]], axis=-1
                             )
+                            # Another entity's variant can vary independently of this entity's variant.
+                            if child.entity is not entity:
+                                child_pos_norm, child_com_norm = child_pos_norm.max(), child_com_norm.max()
+                            hop = child_pos_norm + 2.0 * sum(np.linalg.norm(j.pos) for j in child.joints)
                             # A prismatic descendant carries the subtree outward by up to its full travel span (which
                             # covers the offset from any zero configuration within limits); an unlimited slide makes the
                             # upper bound infinite and the gate enables.
@@ -858,44 +870,52 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                                 np.ptp(j.desc.dofs_limit) for j in child.joints if j.type == gs.JOINT_TYPE.PRISMATIC
                             )
                             dist_origin[child.idx] = dist_origin[cur.idx] + hop
-                            dist_com[child.idx] = dist_origin[child.idx] + np.linalg.norm(child.desc.inertial_pos)
+                            dist_com[child.idx] = dist_origin[child.idx] + child_com_norm
                             stack.append(child)
-                    sub_mass = sum(l.desc.mass for l in sub)
-                    eigvals = np.linalg.eigvalsh(link.desc.inertia)
-                    rot_desc_upper = sum(
-                        np.linalg.eigvalsh(l.desc.inertia)[-1] + l.desc.mass * dist_com[l.idx] ** 2
-                        for l in sub
-                        if l is not link
-                    )
+                    sub_mass_lower = np.zeros(variants_default.size)
+                    sub_mass_upper = np.zeros(variants_default.size)
+                    rot_desc_upper = np.zeros(variants_default.size)
+                    for descendant in sub:
+                        masses = np.array([desc.mass for desc in links_desc[descendant.idx]])
+                        inertia_max = np.linalg.eigvalsh([desc.inertia for desc in links_desc[descendant.idx]])[..., -1]
+                        mass_lower, mass_upper = masses, masses
+                        if descendant.entity is not entity:
+                            mass_lower, mass_upper = masses.min(), masses.max()
+                            inertia_max = inertia_max.max()
+                        sub_mass_lower += mass_lower
+                        sub_mass_upper += mass_upper
+                        if descendant is not link:
+                            rot_desc_upper += inertia_max + mass_upper * dist_com[descendant.idx] ** 2
+                    eigvals = np.linalg.eigvalsh(inertia)
                     # Carrying link's inertia about the anchor: exact along a fixed axis, otherwise between its smallest
                     # and largest principal inertia.
                     if is_sole_joint:
-                        R_inertial = gu.quat_to_R(link.desc.inertial_quat)
-                        inertia_com = R_inertial @ link.desc.inertia @ R_inertial.T
-                        offset_com = link.desc.inertial_pos - anchor
-                        rot_self_lower = eigvals[0]
-                        rot_self_upper = eigvals[-1] + link.desc.mass * np.dot(offset_com, offset_com)
+                        R_inertial = gu.quat_to_R(inertial_quat)
+                        inertia_com = R_inertial @ inertia @ np.swapaxes(R_inertial, -1, -2)
+                        offset_com = inertial_pos - anchor
+                        rot_self_lower = eigvals[..., 0]
+                        rot_self_upper = eigvals[..., -1] + mass * np.sum(offset_com**2, axis=-1)
                     else:
                         inertia_com = None
                         offset_com = None
-                        rot_self_lower = eigvals[0]
-                        rot_self_upper = eigvals[-1] + link.desc.mass * dist_com[link.idx] ** 2
+                        rot_self_lower = eigvals[..., 0]
+                        rot_self_upper = eigvals[..., -1] + mass * dist_com[link.idx] ** 2
                     for i_d, armature_d in enumerate(joint.desc.dofs_armature):
                         if is_rotor and armature_d <= 0.0:
                             armature = variants_default
                         else:
                             armature = np.full(variants_default.size, armature_d)
                         if joint.type == gs.JOINT_TYPE.PRISMATIC or (joint.type == gs.JOINT_TYPE.FREE and i_d < 3):
-                            lower.append(armature + sub_mass)
-                            upper.append(armature + sub_mass)
+                            lower.append(armature + sub_mass_lower)
+                            upper.append(armature + sub_mass_upper)
                         elif joint.type == gs.JOINT_TYPE.REVOLUTE and is_sole_joint:
                             axis = joint.desc.dofs_motion_ang[i_d]
                             lever = np.cross(axis, offset_com)
-                            rot_self = axis @ inertia_com @ axis + link.desc.mass * np.dot(lever, lever)
+                            rot_self = axis @ inertia_com @ axis + mass * np.sum(lever**2, axis=-1)
                             lower.append(armature + rot_self)
                             upper.append(armature + rot_self + rot_desc_upper)
                         else:
-                            lower.append(armature + max(rot_self_lower, 0.0))
+                            lower.append(armature + np.maximum(rot_self_lower, 0.0))
                             upper.append(armature + rot_self_upper + rot_desc_upper)
             if lower:
                 lower, upper = np.array(lower), np.array(upper)
@@ -1055,6 +1075,13 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             links_inertial_pos = np.array([link._variant_inertial[v][1] for v in variant_idx], dtype=gs.np_float)
             links_inertial_quat = np.array([link._variant_inertial[v][2] for v in variant_idx], dtype=gs.np_float)
             links_inertial_i = np.array([link._variant_inertial[v][3] for v in variant_idx], dtype=gs.np_float)
+            links_desc = [link.desc] * n_variants
+            if link.parent_idx != -1:
+                links_desc[1:] = [
+                    variant.links[link.idx - link.entity.link_start] for variant in link.entity.desc.variants[1:]
+                ]
+            links_pos = np.array([links_desc[v].pos for v in variant_idx], dtype=gs.np_float)
+            links_quat = np.array([links_desc[v].quat for v in variant_idx], dtype=gs.np_float)
 
             # Update links_info with per-environment values
             # Note: when batch_links_info is True, the shape is (n_links, B)
@@ -1068,6 +1095,8 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 links_inertial_pos,
                 links_inertial_quat,
                 links_inertial_i,
+                links_pos,
+                links_quat,
                 self.dyn_info,
             )
 
