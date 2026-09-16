@@ -129,7 +129,15 @@ class LegacyCoupler(RBC):
             self.contact_telemetry = ContactTelemetry(
                 self.rigid_solver.n_links, self.sim._B, self.options.contact_buffer_capacity
             )
-        if self._rigid_mpm and not self.mpm_solver.enable_CPIC and not self.sim.requires_grad:
+        # Accumulating impulses defers particle-to-rigid momentum transfer to one batched apply at the
+        # end of the substep. It needs a forward simulation without CPIC: the gradient tape requires the
+        # immediate force path, and CPIC resolves thin-shell separation through its own per-cell normals.
+        # Every kernel branch that calls add_rigid_impulse must test this flag, because rigid_impulses
+        # stays None otherwise and a quadrants kernel resolves the attribute at compile time.
+        self._accumulates_rigid_impulses = (
+            self._rigid_mpm and not self.mpm_solver.enable_CPIC and not self.sim.requires_grad
+        )
+        if self._accumulates_rigid_impulses:
             self.rigid_impulses = RigidImpulses(self.rigid_solver)
         self.reset(envs_idx=self.sim.scene._envs_idx)
 
@@ -376,7 +384,7 @@ class LegacyCoupler(RBC):
             #################### particle -> rigid ####################
             # Compute delta momentum and apply to rigid body.
             delta_mv = mass * (vel - vel_old)
-            if qd.static(is_mpm and not self.sim.requires_grad):
+            if qd.static(is_mpm and self._accumulates_rigid_impulses):
                 add_rigid_impulse(geoms_info.link_idx[geom_idx], i_b, pos_world, -delta_mv, self.rigid_impulses)
             else:
                 force = -delta_mv / rigid_info.substep_dt[None]
@@ -433,7 +441,12 @@ class LegacyCoupler(RBC):
                             speed = qd.min(self.options.rigid_pushout_speed, -distance / self.mpm_solver.substep_dt)
                             increment = qd.max(0.0, speed - (vel - velocity_rigid).dot(normal)) * normal
                             vel += increment
-                            add_rigid_impulse(i_l, i_b, pos_world, -mass * increment, self.rigid_impulses)
+                            if qd.static(self._accumulates_rigid_impulses):
+                                add_rigid_impulse(i_l, i_b, pos_world, -mass * increment, self.rigid_impulses)
+                            else:
+                                self.rigid_solver._func_apply_coupling_force(
+                                    i_l, i_b, pos_world, -mass * increment / rigid_info.substep_dt[None], links_state
+                                )
                     impulse = mass * (velocity_old - vel)
                     if qd.static(self._is_contact_telemetry_enabled):
                         if impulse.norm_sqr() > 0.0:
