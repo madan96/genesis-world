@@ -271,6 +271,13 @@ class BaseCameraSensor(KinematicSensorMixin, Sensor[OptionsT, None, SharedSensor
         # every environment. Extend the caching mechanism to be env-aware so envs_idx only refreshes the reset envs.
         shared_metadata.last_render_timestep = -1
 
+    @classmethod
+    def state_restored(cls, shared_metadata: SharedSensorMetadata) -> None:
+        super().state_restored(shared_metadata)
+        # Restoring a snapshot installs a different state at the timestep the cached frame was rendered for, so the
+        # next read must rerender instead of serving that frame. The frame cache holds no restorable tensor itself.
+        shared_metadata.last_render_timestep = -1
+
     def _draw_debug(self, context: "RasterizerContext"):
         """No debug drawing for cameras."""
         pass
@@ -456,6 +463,12 @@ class RasterizerCameraSensor(
     def reset(cls, shared_metadata: SharedSensorMetadata, shared_ground_truth_cache: torch.Tensor, envs_idx):
         super().reset(shared_metadata, shared_ground_truth_cache, envs_idx)
         # The context syncs with the simulation once per step, so a reset at the last synced step must clear that
+        shared_metadata.context.reset()
+
+    @classmethod
+    def state_restored(cls, shared_metadata: SharedSensorMetadata) -> None:
+        super().state_restored(shared_metadata)
+        # The context syncs with the simulation once per step, so a restore at the last synced step must clear that.
         shared_metadata.context.reset()
 
     def _ensure_camera_registered(self):
