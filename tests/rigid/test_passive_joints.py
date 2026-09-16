@@ -42,11 +42,15 @@ def test_passive_actuator_coexistence(independent_scalar_joints, show_viewer, jo
         soft_exponent=2,
         damping=[0.4, 0.5],
         friction=[0.1, 0.2],
+        force_limit=[[0.9, np.inf], [0.8, np.inf]],
     )
     spring.set_params(k_neutral=1)
+    with pytest.raises(gs.GenesisException):
+        model.set_params(force_limit=-1)
     position = np.array([[0.6, -0.8], [-0.4, 0.7]])
     velocity = np.array([[0.2, -0.3], [-0.1, 0.4]])
     stiffness = np.array([[2.0, 3.0], [2.0, 3.0]])
+    force_limit = np.array([[0.9, np.inf], [0.8, np.inf]])
     entity.set_dofs_position(position)
     entity.set_dofs_velocity(velocity)
     for i in range(5):
@@ -62,15 +66,22 @@ def test_passive_actuator_coexistence(independent_scalar_joints, show_viewer, jo
         limits = [4, 5] * (np.maximum([-0.15, -0.3] - position, 0) ** 2 - np.maximum(position - [0.25, 0.4], 0) ** 2)
         assert_allclose(model.get_passive_dofs_force(), passive, atol=3e-6)
         assert_allclose(model.get_limit_dofs_force(), limits, atol=3e-6)
+        assert_allclose(model.get_applied_dofs_force(), np.clip(passive + limits, -force_limit, force_limit), atol=3e-6)
+        assert (np.abs(passive + limits) > force_limit).any()
         for _ in range(2):
             force = (
                 np.clip(command, -0.25, 0.25)
-                - stiffness * (position - [0.1, -0.2])
-                - [0.4, 0.5] * velocity
-                - [0.1, 0.2] * np.tanh(velocity / 0.05)
+                + np.clip(
+                    -stiffness * (position - [0.1, -0.2])
+                    - [0.4, 0.5] * velocity
+                    - [0.1, 0.2] * np.tanh(velocity / 0.05)
+                    + [4, 5]
+                    * (np.maximum([-0.15, -0.3] - position, 0) ** 2 - np.maximum(position - [0.25, 0.4], 0) ** 2),
+                    -force_limit,
+                    force_limit,
+                )
                 - [0.6, 0.8] * position
                 - [0.1, 0.2] * velocity
-                + [4, 5] * (np.maximum([-0.15, -0.3] - position, 0) ** 2 - np.maximum(position - [0.25, 0.4], 0) ** 2)
             )
             force[:, 0] -= position[:, 0]
             # Revolute inertia is 2/5 * 2 * 0.2^2 + armature 0.068 = 0.1; each slider has mass 0.1.

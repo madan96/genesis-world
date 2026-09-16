@@ -46,6 +46,7 @@ class PassiveJointInfo:
     soft_exponent: qd.Tensor
     damping: qd.Tensor
     friction: qd.Tensor
+    force_limit: qd.Tensor
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,7 @@ class PassiveJointState:
     passive_force: qd.Tensor
     limit_force: qd.Tensor
     coupled_force: qd.Tensor
+    applied_force: qd.Tensor
     potential_energy: qd.Tensor
 
 
@@ -190,24 +192,28 @@ def kernel_passive_joints(
         energy += (
             stiffness_limit * (lower_excess ** (exponent + 1.0) + upper_excess ** (exponent + 1.0)) / (exponent + 1.0)
         )
+        force_limit = passive_info.force_limit[i_d_, i_b]
+        applied_force = qd.math.clamp(passive_force + limit_force, -force_limit, force_limit)
         passive_state.passive_force[i_d_, i_b] = passive_force
         passive_state.limit_force[i_d_, i_b] = limit_force
+        passive_state.applied_force[i_d_, i_b] = applied_force
         passive_state.potential_energy[i_d_, i_b] = energy
         if qd.static(is_apply):
-            dyn_state.dofs.qf_passive_model[i_d, i_b] += passive_force + limit_force
+            dyn_state.dofs.qf_passive_model[i_d, i_b] += applied_force
 
 
 class PassiveJointModel:
     """Add elastic, dissipative and soft-limit forces to an entity's scalar joints.
 
     Register before ``scene.build()``. The model adds forces to native joint springs and damping, alongside actuator
-    commands. Actuator effort limits apply to the actuator contribution. Joint coordinates are the values returned by
-    ``get_dofs_position()`` (radians for revolute joints and metres for prismatic joints). Free and spherical joints
-    need a rotational potential on their configuration manifold and cannot be selected here.
+    commands. Actuator effort limits apply to the actuator contribution, and ``force_limit`` bounds the force this
+    model applies. Joint coordinates are the values returned by ``get_dofs_position()`` (radians for revolute joints
+    and metres for prismatic joints). Free and spherical joints need a rotational potential on their configuration
+    manifold and cannot be selected here.
 
-    Parameters are zero by default and set after build. Each value can vary by environment and survives
-    ``scene.reset()``. Solver checkpoints include these parameters. All force getters return owned tensors with shape
-    ``(max(n_envs, 1), n_dofs)`` evaluated at the current state.
+    Parameters are zero by default, with infinite soft bounds and force limit, and set after build. Each value can vary
+    by environment and survives ``scene.reset()``. Solver checkpoints include these parameters. All force getters
+    return owned tensors with shape ``(max(n_envs, 1), n_dofs)`` evaluated at the current state.
     """
 
     def __init__(
@@ -300,13 +306,14 @@ class PassiveJointModel:
         shape = (self.n_dofs, self._solver._B)
         self._info = PassiveJointInfo(
             array_class.V(gs.qd_int, (self.n_dofs,)),
-            *(array_class.V(gs.qd_float, shape) for _ in range(8)),
+            *(array_class.V(gs.qd_float, shape) for _ in range(9)),
         )
         self._info.dofs_idx.from_numpy(self.dofs_idx)
         self._info.soft_lo.fill(float("-inf"))
         self._info.soft_hi.fill(float("inf"))
         self._info.soft_exponent.fill(1.0)
-        self._state = PassiveJointState(*(array_class.V(gs.qd_float, shape) for _ in range(4)))
+        self._info.force_limit.fill(float("inf"))
+        self._state = PassiveJointState(*(array_class.V(gs.qd_float, shape) for _ in range(5)))
         for group in self._groups:
             shape_members = (len(group.slots), self._solver._B)
             group.info = CoupledLimitInfo(
@@ -350,15 +357,19 @@ class PassiveJointModel:
         soft_exponent=None,
         damping=None,
         friction=None,
+        force_limit=None,
         envs_idx=None,
     ):
         """Set parameters broadcast over ``(selected environments, model DOFs)``.
 
         Neutral torque is ``-k_neutral * (q - q_neutral)``. Soft-limit torque is a restoring power law outside
         ``[soft_lo, soft_hi]``. Damping is ``-damping * velocity`` and friction is
-        ``-friction * tanh(velocity / friction_vel_eps)``. Stiffnesses, damping and friction must be nonnegative and
-        ``soft_exponent >= 1``. Values of None retain the current parameter. Invalid updates leave every parameter
-        unchanged. Coordinates use the units of their selected DOF, and forces use N*m or N accordingly.
+        ``-friction * tanh(velocity / friction_vel_eps)``. The applied force is the sum of these terms clamped to
+        ``[-force_limit, force_limit]``. The raw terms stay readable through their getters, and a saturated DOF applies
+        a force of smaller magnitude than the gradient of ``get_potential_energy``. Stiffnesses, damping and friction
+        must be nonnegative, ``soft_exponent >= 1`` and ``force_limit >= 0`` (infinite by default). Values of None
+        retain the current parameter. Invalid updates leave every parameter unchanged. Coordinates use the units of
+        their selected DOF, and forces use N*m or N accordingly.
         """
         if self._info is None:
             gs.raise_exception("Set passive joint parameters after scene.build().")
@@ -373,6 +384,7 @@ class PassiveJointModel:
             (self._info.soft_exponent, soft_exponent, 1.0, False),
             (self._info.damping, damping, 0.0, False),
             (self._info.friction, friction, 0.0, False),
+            (self._info.force_limit, force_limit, 0.0, True),
         ):
             if value is not None:
                 updates.append(
@@ -479,6 +491,11 @@ class PassiveJointModel:
         """Return current coupled soft-limit forces, shape ``(B, n_dofs)``."""
         self._evaluate()
         return qd_to_torch(self._state.coupled_force, transpose=True, copy=True)
+
+    def get_applied_dofs_force(self) -> torch.Tensor:
+        """Return the current force the model applies after ``force_limit``, shape ``(B, n_dofs)``."""
+        self._evaluate()
+        return qd_to_torch(self._state.applied_force, transpose=True, copy=True)
 
     def get_coupled_limit_violation(self) -> torch.Tensor:
         """Return current excess per group, shape ``(B, n_groups)`` (maximum face excess for polytopes)."""
