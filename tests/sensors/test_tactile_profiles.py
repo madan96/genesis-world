@@ -37,6 +37,19 @@ def test_tactile_profile_serialization(tmp_path, suffix):
     record["gain"][0] = 99.0
     assert loaded.gain[0] == 0.7
 
+    # A loaded profile supplies the taxel geometry and electronics of a sensor; explicit options take precedence.
+    options = gs.sensors.SolverContactTaxel.from_profile(loaded, entity_idx=0)
+    assert_allclose(options.probe_local_pos, ((0.0, 0.0, 0.0), (0.02, 0.0, 0.0)), tol=0)
+    assert_allclose(options.probe_local_normal, (0.0, 0.0, 1.0), tol=0)
+    assert_allclose(options.probe_radius, 0.01, tol=0)
+    assert_allclose(options.probe_gain, (0.7, 1.4), tol=0)
+    assert options.hardware_profile.to_dict() == loaded.to_dict()
+    options = gs.sensors.SolverContactTaxel.from_profile(loaded, entity_idx=0, probe_radius=0.02, probe_gain=2.0)
+    assert_allclose(options.probe_radius, 0.02, tol=0)
+    assert_allclose(options.probe_gain, 2.0, tol=0)
+    with pytest.raises(gs.GenesisException, match="taxel_pos"):
+        gs.sensors.SolverContactTaxel.from_profile(gs.sensors.TactileHardwareProfile(), entity_idx=0)
+
     untouched = tmp_path / "profile.unsupported"
     untouched.write_text("existing contents")
     with pytest.raises(gs.GenesisException, match="destination"):

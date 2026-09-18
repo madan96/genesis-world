@@ -91,16 +91,21 @@ def func_forward_dynamics(
     dyn_info: array_class.DynInfo,
     rigid_info: array_class.RigidInfo,
     rigid_config: qd.template(),
+    is_mass_mat_updated: qd.template(),
     is_backward: qd.template(),
 ):
-    func_compute_mass_matrix(
-        dyn_state,
-        dyn_info,
-        rigid_info,
-        rigid_config,
-        qd.static(rigid_config.integrator == gs.integrator.approximate_implicitfast),
-        is_backward,
-    )
+    # An updated mass matrix lacks only the implicit damping (see RigidSolver._is_mass_mat_updated)
+    if qd.static(not is_mass_mat_updated):
+        func_compute_mass_matrix(
+            dyn_state,
+            dyn_info,
+            rigid_info,
+            rigid_config,
+            qd.static(rigid_config.integrator == gs.integrator.approximate_implicitfast),
+            is_backward,
+        )
+    elif qd.static(rigid_config.integrator == gs.integrator.approximate_implicitfast):
+        func_add_mass_mat_implicit_damping(dyn_state, dyn_info, rigid_info, rigid_config)
     func_factor_mass(dyn_state, dyn_info, rigid_info, rigid_config, implicit_damping=False)
     func_torque_and_passive_force(dyn_state, constraint_state, dyn_info, rigid_info, rigid_config, is_backward)
     func_update_acc(dyn_state, dyn_info, rigid_info, rigid_config, update_cacc=False, is_backward=is_backward)
@@ -117,7 +122,9 @@ def kernel_forward_dynamics(
     rigid_info: array_class.RigidInfo,
     rigid_config: qd.template(),
 ):
-    func_forward_dynamics(dyn_state, constraint_state, dyn_info, rigid_info, rigid_config, is_backward=False)
+    func_forward_dynamics(
+        dyn_state, constraint_state, dyn_info, rigid_info, rigid_config, is_mass_mat_updated=False, is_backward=False
+    )
 
 
 @qd.kernel(fastcache=True)
@@ -301,6 +308,30 @@ def func_mass_mat_assemble(
 
 
 @qd.func
+def func_is_mass_row_assembled(
+    i_d,
+    i_b,
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
+    rigid_config: qd.template(),
+):
+    """Whether the mass-matrix row of one DOF is assembled this step, which holds unless the entity rooting its mass
+    block is hibernated (see func_mass_mat_assemble).
+
+    A hibernated entity keeps the mass matrix of its last awake step, armature and implicit terms included, so the
+    terms added to the diagonal after the assembly skip it too instead of accumulating on every substep.
+    """
+    is_assembled = True
+    if qd.static(rigid_config.use_hibernation):
+        i_d_root = rigid_info.dofs_mass_block_start[i_d]
+        I_d_root = [i_d_root, i_b] if qd.static(rigid_config.batch_dofs_info) else i_d_root
+        i_e = dyn_info.dofs.entity_idx[I_d_root]
+        is_assembled = not dyn_state.entities.is_hibernated[i_e, i_b]
+    return is_assembled
+
+
+@qd.func
 def func_mass_mat_armature(
     i_d,
     i_b,
@@ -315,6 +346,31 @@ def func_mass_mat_armature(
 
 
 @qd.func
+def func_add_implicit_damping(
+    i_d,
+    i_b,
+    mass_diag,
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
+    rigid_config: qd.template(),
+):
+    """Return a diagonal entry of the mass matrix of one DOF plus the first-order terms that make its integration
+    implicit: substep_dt times minus the derivative of the velocity-dependent forces of the DOF (native damping, the
+    passive joint models and, outside the Euler integrator, velocity-servo actuation).
+    """
+    I_d = [i_d, i_b] if qd.static(rigid_config.batch_dofs_info) else i_d
+    implicit_diag = mass_diag + dyn_info.dofs.damping[I_d] * rigid_info.substep_dt[None]
+    if qd.static(rigid_config.has_passive_joints):
+        implicit_diag = implicit_diag + dyn_state.dofs.damping_passive_model[i_d, i_b] * rigid_info.substep_dt[None]
+    if qd.static(rigid_config.integrator != gs.integrator.Euler):
+        if dyn_state.dofs.ctrl_mode[i_d, i_b] <= gs.CTRL_MODE.VELOCITY:
+            # qM += d qfrc_actuator / d qvel = -act_bias[2] * dt
+            implicit_diag = implicit_diag - dyn_info.dofs.act_bias[I_d][2] * rigid_info.substep_dt[None]
+    return implicit_diag
+
+
+@qd.func
 def func_mass_mat_implicit_damping(
     i_d,
     i_b,
@@ -324,15 +380,23 @@ def func_mass_mat_implicit_damping(
     rigid_config: qd.template(),
 ):
     """Add to the mass matrix the first-order terms that make the integration of one DOF implicit."""
-    I_d = [i_d, i_b] if qd.static(rigid_config.batch_dofs_info) else i_d
-    rigid_info.mass_mat[i_d, i_d, i_b] = (
-        rigid_info.mass_mat[i_d, i_d, i_b] + dyn_info.dofs.damping[I_d] * rigid_info.substep_dt[None]
+    rigid_info.mass_mat[i_d, i_d, i_b] = func_add_implicit_damping(
+        i_d, i_b, rigid_info.mass_mat[i_d, i_d, i_b], dyn_state, dyn_info, rigid_info, rigid_config
     )
-    if dyn_state.dofs.ctrl_mode[i_d, i_b] <= gs.CTRL_MODE.VELOCITY:
-        # qM += d qfrc_actuator / d qvel = -act_bias[2] * dt
-        rigid_info.mass_mat[i_d, i_d, i_b] = (
-            rigid_info.mass_mat[i_d, i_d, i_b] - dyn_info.dofs.act_bias[I_d][2] * rigid_info.substep_dt[None]
-        )
+
+
+@qd.func
+def func_add_mass_mat_implicit_damping(
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
+    rigid_config: qd.template(),
+):
+    """Add the first-order implicit damping terms to the mass-matrix rows assembled this step, in every environment."""
+    qd.loop_config(name="impint_order_1_corr", serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
+    for i_d, i_b in qd.ndrange(dyn_state.dofs.f_ang.shape[0], dyn_state.dofs.f_ang.shape[1]):
+        if func_is_mass_row_assembled(i_d, i_b, dyn_state, dyn_info, rigid_info, rigid_config):
+            func_mass_mat_implicit_damping(i_d, i_b, dyn_state, dyn_info, rigid_info, rigid_config)
 
 
 @qd.func
@@ -385,12 +449,11 @@ def func_compute_mass_matrix(
 
     qd.loop_config(name="armature", serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
     for i_d, i_b in qd.ndrange(dyn_state.dofs.f_ang.shape[0], dyn_state.dofs.f_ang.shape[1]):
-        func_mass_mat_armature(i_d, i_b, dyn_info, rigid_info, rigid_config, is_backward)
+        if func_is_mass_row_assembled(i_d, i_b, dyn_state, dyn_info, rigid_info, rigid_config):
+            func_mass_mat_armature(i_d, i_b, dyn_info, rigid_info, rigid_config, is_backward)
 
     if qd.static(implicit_damping):
-        qd.loop_config(name="impint_order_1_corr", serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
-        for i_d, i_b in qd.ndrange(dyn_state.dofs.f_ang.shape[0], dyn_state.dofs.f_ang.shape[1]):
-            func_mass_mat_implicit_damping(i_d, i_b, dyn_state, dyn_info, rigid_info, rigid_config)
+        func_add_mass_mat_implicit_damping(dyn_state, dyn_info, rigid_info, rigid_config)
 
 
 @qd.func
@@ -438,12 +501,16 @@ def func_compute_mass_matrix_masked(
 
     qd.loop_config(name="armature", serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
     for i_d, i_b_ in qd.ndrange(dyn_state.dofs.f_ang.shape[0], envs_idx.shape[0]):
-        func_mass_mat_armature(i_d, envs_idx[i_b_], dyn_info, rigid_info, rigid_config, is_backward)
+        i_b = envs_idx[i_b_]
+        if func_is_mass_row_assembled(i_d, i_b, dyn_state, dyn_info, rigid_info, rigid_config):
+            func_mass_mat_armature(i_d, i_b, dyn_info, rigid_info, rigid_config, is_backward)
 
     if qd.static(implicit_damping):
         qd.loop_config(name="impint_order_1_corr", serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
         for i_d, i_b_ in qd.ndrange(dyn_state.dofs.f_ang.shape[0], envs_idx.shape[0]):
-            func_mass_mat_implicit_damping(i_d, envs_idx[i_b_], dyn_state, dyn_info, rigid_info, rigid_config)
+            i_b = envs_idx[i_b_]
+            if func_is_mass_row_assembled(i_d, i_b, dyn_state, dyn_info, rigid_info, rigid_config):
+                func_mass_mat_implicit_damping(i_d, i_b, dyn_state, dyn_info, rigid_info, rigid_config)
 
 
 @qd.func
@@ -510,19 +577,17 @@ def func_factor_mass_entity_tiled(
                         rigid_info.mass_mat_tiled_scratch[i_b, block_start + i_d_, block_start + j_d_] = m
                         rigid_info.mass_mat_tiled_scratch[i_b, block_start + j_d_, block_start + i_d_] = m
                     if qd.static(implicit_damping):
-                        # Reverse-diagonal slot i_d_ holds M[ri_, ri_]; damping/act_bias index the original DOF.
-                        i_d = block_start + ri_
-                        I_d = [i_d, i_b] if qd.static(rigid_config.batch_dofs_info) else i_d
-                        rigid_info.mass_mat_tiled_scratch[i_b, block_start + i_d_, block_start + i_d_] = (
-                            rigid_info.mass_mat_tiled_scratch[i_b, block_start + i_d_, block_start + i_d_]
-                            + dyn_info.dofs.damping[I_d] * rigid_info.substep_dt[None]
+                        # Reverse-diagonal slot i_d_ holds M[ri_, ri_]; the implicit terms index the original DOF.
+                        i_s = block_start + i_d_
+                        rigid_info.mass_mat_tiled_scratch[i_b, i_s, i_s] = func_add_implicit_damping(
+                            block_start + ri_,
+                            i_b,
+                            rigid_info.mass_mat_tiled_scratch[i_b, i_s, i_s],
+                            dyn_state,
+                            dyn_info,
+                            rigid_info,
+                            rigid_config,
                         )
-                        if qd.static(rigid_config.integrator == gs.integrator.implicitfast):
-                            if dyn_state.dofs.ctrl_mode[i_d, i_b] <= gs.CTRL_MODE.VELOCITY:
-                                rigid_info.mass_mat_tiled_scratch[i_b, block_start + i_d_, block_start + i_d_] = (
-                                    rigid_info.mass_mat_tiled_scratch[i_b, block_start + i_d_, block_start + i_d_]
-                                    - dyn_info.dofs.act_bias[I_d][2] * rigid_info.substep_dt[None]
-                                )
                     i_d_ = i_d_ + T
                 qd.simt.block.sync()
 
@@ -712,17 +777,15 @@ def func_factor_mass_entity_global(
                     for j_d in range(block_start, i_d + 1):
                         rigid_info.mass_mat_L[i_d, j_d, i_b] = rigid_info.mass_mat[i_d, j_d, i_b]
                     if qd.static(implicit_damping):
-                        I_d = [i_d, i_b] if qd.static(rigid_config.batch_dofs_info) else i_d
-                        rigid_info.mass_mat_L[i_d, i_d, i_b] = (
-                            rigid_info.mass_mat_L[i_d, i_d, i_b]
-                            + dyn_info.dofs.damping[I_d] * rigid_info.substep_dt[None]
+                        rigid_info.mass_mat_L[i_d, i_d, i_b] = func_add_implicit_damping(
+                            i_d,
+                            i_b,
+                            rigid_info.mass_mat_L[i_d, i_d, i_b],
+                            dyn_state,
+                            dyn_info,
+                            rigid_info,
+                            rigid_config,
                         )
-                        if qd.static(rigid_config.integrator == gs.integrator.implicitfast):
-                            if dyn_state.dofs.ctrl_mode[i_d, i_b] <= gs.CTRL_MODE.VELOCITY:
-                                rigid_info.mass_mat_L[i_d, i_d, i_b] = (
-                                    rigid_info.mass_mat_L[i_d, i_d, i_b]
-                                    - dyn_info.dofs.act_bias[I_d][2] * rigid_info.substep_dt[None]
-                                )
                     i_d_ = i_d_ + BLOCK_DIM
                 qd.simt.block.sync()
 
@@ -785,16 +848,9 @@ def func_factor_mass_entity(
                 rigid_info.mass_mat_L[i_d, j_d, i_b] = rigid_info.mass_mat[i_d, j_d, i_b]
 
             if qd.static(implicit_damping):
-                I_d = [i_d, i_b] if qd.static(rigid_config.batch_dofs_info) else i_d
-                rigid_info.mass_mat_L[i_d, i_d, i_b] = (
-                    rigid_info.mass_mat_L[i_d, i_d, i_b] + dyn_info.dofs.damping[I_d] * rigid_info.substep_dt[None]
+                rigid_info.mass_mat_L[i_d, i_d, i_b] = func_add_implicit_damping(
+                    i_d, i_b, rigid_info.mass_mat_L[i_d, i_d, i_b], dyn_state, dyn_info, rigid_info, rigid_config
                 )
-                if qd.static(rigid_config.integrator == gs.integrator.implicitfast):
-                    if dyn_state.dofs.ctrl_mode[i_d, i_b] <= gs.CTRL_MODE.VELOCITY:
-                        rigid_info.mass_mat_L[i_d, i_d, i_b] = (
-                            rigid_info.mass_mat_L[i_d, i_d, i_b]
-                            - dyn_info.dofs.act_bias[I_d][2] * rigid_info.substep_dt[None]
-                        )
 
         for i_d_ in range(blocks_dof_end - blocks_dof_start):
             i_d = blocks_dof_end - i_d_ - 1
@@ -856,16 +912,9 @@ def func_factor_mass_entity_shared(
                 if qd.static(implicit_damping):
                     i_d_ = tid
                     while i_d_ < n_block_dofs:
-                        i_d = block_start + i_d_
-                        I_d = [i_d, i_b] if qd.static(rigid_config.batch_dofs_info) else i_d
-                        mass_mat[i_d_, i_d_] = (
-                            mass_mat[i_d_, i_d_] + dyn_info.dofs.damping[I_d] * rigid_info.substep_dt[None]
+                        mass_mat[i_d_, i_d_] = func_add_implicit_damping(
+                            block_start + i_d_, i_b, mass_mat[i_d_, i_d_], dyn_state, dyn_info, rigid_info, rigid_config
                         )
-                        if qd.static(rigid_config.integrator == gs.integrator.implicitfast):
-                            if dyn_state.dofs.ctrl_mode[i_d, i_b] <= gs.CTRL_MODE.VELOCITY:
-                                mass_mat[i_d_, i_d_] = (
-                                    mass_mat[i_d_, i_d_] - dyn_info.dofs.act_bias[I_d][2] * rigid_info.substep_dt[None]
-                                )
                         i_d_ = i_d_ + BLOCK_DIM
                     qd.simt.block.sync()
 
@@ -2359,6 +2408,9 @@ def func_implicit_damping(
                 I_d = [i_d, i_b] if qd.static(rigid_config.batch_dofs_info) else i_d
                 if dyn_info.dofs.damping[I_d] > EPS:
                     rigid_info.mass_mat_mask[i_e, i_b] = True
+                if qd.static(rigid_config.has_passive_joints):
+                    if dyn_state.dofs.damping_passive_model[i_d, i_b] > EPS:
+                        rigid_info.mass_mat_mask[i_e, i_b] = True
                 if qd.static(rigid_config.integrator != gs.integrator.Euler):
                     if (
                         dyn_state.dofs.ctrl_mode[i_d, i_b] <= gs.CTRL_MODE.VELOCITY

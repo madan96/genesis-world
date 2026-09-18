@@ -11,7 +11,7 @@ import genesis as gs
 from genesis.repr_base import RBC
 from genesis.typing import NumArrayType, NumericType
 from genesis.utils.geom import euler_to_quat
-from genesis.utils.misc import broadcast_tensor, concat_with_tensor, make_tensor_field
+from genesis.utils.misc import broadcast_tensor, concat_with_tensor, make_tensor_field, tensor_to_array
 
 if TYPE_CHECKING:
     from genesis.engine.entities.rigid_entity.rigid_link import RigidLink
@@ -37,6 +37,17 @@ def _to_tuple(*values: NumArrayType, length_per_value: int = 3) -> tuple[Numeric
             value = value.reshape((-1,))
         full_tuple += tuple(value)
     return full_tuple
+
+
+def _check_imperfection_value(name: str, value, *, allow_negative: bool) -> None:
+    """Raise unless every entry of an imperfection parameter is finite, and nonnegative unless ``allow_negative``.
+
+    A NaN or negative scale would otherwise surface only at the next step, inside the noise draw.
+    """
+    values = torch.as_tensor(value, dtype=gs.tc_float, device=gs.device)
+    if not torch.isfinite(values).all() or (not allow_negative and (values < 0.0).any()):
+        requirement = "finite" if allow_negative else "finite and nonnegative"
+        gs.raise_exception(f"Sensor {name} must be {requirement}; got {name}={tuple(values.reshape(-1).tolist())}.")
 
 
 # Note: dataclass is used as opposed to pydantic.BaseModel since torch.Tensors are not supported by default
@@ -749,6 +760,7 @@ class SimpleSensor(Sensor[OptionsT, SharedSensorContextT, SharedSensorMetadataT,
 
     @gs.assert_built
     def set_resolution(self, resolution, envs_idx=None):
+        _check_imperfection_value("resolution", resolution, allow_negative=False)
         self._set_metadata_field(
             resolution, self._shared_metadata.resolution, self._cache_offset, self._cache_size, envs_idx
         )
@@ -756,11 +768,13 @@ class SimpleSensor(Sensor[OptionsT, SharedSensorContextT, SharedSensorMetadataT,
 
     @gs.assert_built
     def set_bias(self, bias, envs_idx=None):
+        _check_imperfection_value("bias", bias, allow_negative=True)
         self._set_metadata_field(bias, self._shared_metadata.bias, self._cache_offset, self._cache_size, envs_idx)
         self._shared_metadata.has_any_bias = bool((self._shared_metadata.bias != 0).any().item())
 
     @gs.assert_built
     def set_random_walk(self, random_walk, envs_idx=None):
+        _check_imperfection_value("random_walk", random_walk, allow_negative=False)
         self._set_metadata_field(
             random_walk, self._shared_metadata.random_walk, self._cache_offset, self._cache_size, envs_idx
         )
@@ -768,14 +782,15 @@ class SimpleSensor(Sensor[OptionsT, SharedSensorContextT, SharedSensorMetadataT,
 
     @gs.assert_built
     def set_noise(self, noise, envs_idx=None):
+        _check_imperfection_value("noise", noise, allow_negative=False)
         self._set_metadata_field(noise, self._shared_metadata.noise, self._cache_offset, self._cache_size, envs_idx)
         self._shared_metadata.has_any_noise = bool((self._shared_metadata.noise > gs.EPS).any().item())
 
     @gs.assert_built
     def set_jitter(self, jitter, envs_idx=None):
-        jitter_np = np.asarray(jitter, dtype=gs.np_float)
-        if np.any(jitter_np < 0):
-            gs.raise_exception(f"Sensor jitter must be non-negative; got jitter={tuple(jitter_np.ravel())}.")
+        jitter_np = tensor_to_array(jitter, dtype=gs.np_float)
+        if not np.isfinite(jitter_np).all() or np.any(jitter_np < 0):
+            gs.raise_exception(f"Sensor jitter must be finite and non-negative; got jitter={tuple(jitter_np.ravel())}.")
         if np.any(jitter_np >= self._dt + gs.EPS):
             gs.raise_exception(
                 f"Sensor jitter must not exceed the simulation step dt={self._dt}; got "

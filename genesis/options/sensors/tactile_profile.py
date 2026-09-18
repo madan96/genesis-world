@@ -72,7 +72,13 @@ class TactileTransferCurve(Options):
 
     @property
     def is_identity(self) -> bool:
-        return self.kind == "linear" and self.scale == 1.0 and self.saturation is None and self.dead_band == 0.0
+        """Whether the curve returns every magnitude unchanged."""
+        return (
+            self.kind == "linear"
+            and abs(self.scale - 1.0) <= gs.EPS
+            and self.saturation is None
+            and self.dead_band <= gs.EPS
+        )
 
     def apply_magnitude(self, magnitude: torch.Tensor, saturation_scale: torch.Tensor | None = None) -> torch.Tensor:
         """Convert nonnegative finite magnitudes on their current device, returning a fresh tensor.
@@ -103,7 +109,8 @@ class TactileHardwareProfile(Options):
     Delay/jitter/filter and hysteresis time constants are seconds. ``sample_rate=None`` samples every simulation
     step. A finite rate samples at simulation instants reaching its requested sampling times. ``gain_variation``
     is a positive multiplicative per-reset gain range. Dead-taxel probability and stuck-value range apply per reset.
-    Hysteresis strength and crosstalk strength are dimensionless. Crosstalk sigma is a distance in meters.
+    Hysteresis strength and crosstalk strength are dimensionless, and the hysteresis loop depends on the load rate
+    (see SolverContactTaxel). Crosstalk sigma is a distance in meters.
 
     Temperature coefficients modify gain (1/degree C) and normal offset (N/degree C) relative to ``temperature_c``.
     These parameters describe a simulation model. Calibration provenance belongs in ``notes``.

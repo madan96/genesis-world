@@ -111,6 +111,16 @@ def test_continuous_skin_binding(n_envs, heterogeneous, phase, skin_articulation
     assert_allclose(mass.rigid_total, 4.0, tol=1e-6)
     assert_allclose(mass.soft_total, 1.0, tol=1e-6)
     assert_allclose(mass.soft_mass_by_weighted_link, (0.25, 0.75), tol=1e-6)
+    # Each link keeps its authored share of the total mass, 2.5 kg, the skin bound to it included, and its inertia scales
+    # with its rigid mass from the authored 2 kg, expressed in link axes.
+    assert_allclose(mass.per_rigid_link + mass.soft_mass_by_weighted_link, 2.5, tol=1e-6)
+    inertia = torch.tensor(
+        ((0.11, 0.02, 0.01), (0.02, 0.09, 0.015), (0.01, 0.015, 0.13)), dtype=gs.tc_float, device=gs.device
+    )
+    links_inertia = inertia * (mass.per_rigid_link[0] / 2.0)[:, None, None]
+    assert_allclose(
+        torch.linalg.eigvalsh(human.part_rigid.get_links_inertia()), torch.linalg.eigvalsh(links_inertia), tol=1e-6
+    )
     binding = human.get_binding_diagnostics()
     assert_allclose(binding.weights[:, :2], (0.75, 0.25), tol=1e-6)
     assert_allclose(binding.weights.sum(dim=-1), 1.0, tol=1e-6)
@@ -155,11 +165,8 @@ def test_continuous_skin_binding(n_envs, heterogeneous, phase, skin_articulation
     soft_angular_momentum = (
         torch.linalg.cross(human.part_soft.get_particles_pos(), soft_velocity) * binding.particle_mass[..., None]
     ).sum(dim=-2)
-    inertia = torch.tensor(
-        ((0.11, 0.02, 0.01), (0.02, 0.09, 0.015), (0.01, 0.015, 0.13)), dtype=gs.tc_float, device=gs.device
-    )
     rotation_world = geom.quat_to_R(human.part_rigid.get_links_quat())
-    inertia_world = rotation_world @ inertia @ rotation_world.transpose(-1, -2)
+    inertia_world = rotation_world @ links_inertia @ rotation_world.transpose(-1, -2)
     rigid_angular_momentum = (
         (inertia_world @ rigid_angular_velocity[..., None])[..., 0]
         + torch.linalg.cross(rigid_position, rigid_velocity * mass.per_rigid_link[..., None])
@@ -234,28 +241,34 @@ def test_continuous_skin_binding(n_envs, heterogeneous, phase, skin_articulation
             potentials.append(0.5 * (particle_mass[:, None] * offset_delta**2).sum() / 0.01**2)
         torque_joint = torque[:, 1, 2] - 0.2 * force[:, 1, 1]
         assert_allclose(torque_joint, -(potentials[1] - potentials[0]) / 2e-4, tol=1e-6)
-    # A free-link block-row norm bounds articulation mobility using both spring and damping lever arms.
+    # A free-link block-row sum bounds articulation mobility: the soft mass bound to each link over its mass, plus the
+    # product of the lever gains sqrt(lambda_max(S^T I^-1 S)), S the cross-product matrix of a spring or damping arm.
     link_idx = tensor_to_array(binding.link_idx)
     weights = tensor_to_array(binding.weights, dtype=np.float64)
     is_tip = link_idx == human.part_rigid.links[1].idx
     anchors = np.where(is_tip[..., None], tip_anchors[:, None], particles[:, None])
     center_local = np.array((0.02, 0.01, -0.01))
     centers = np.where(is_tip[..., None], rotation @ center_local + tip_offset, center_local)
-    radius = np.maximum(
-        np.linalg.norm(particles[:, None] - centers, axis=-1), np.linalg.norm(anchors - centers, axis=-1)
-    )
+    links_rotation = np.stack((np.eye(3), rotation))
+    links_inverse_inertia = np.linalg.inv(tensor_to_array(links_inertia, dtype=np.float64))
+    links_inverse_inertia = links_rotation @ links_inverse_inertia @ links_rotation.transpose(0, 2, 1)
+    inverse_inertia = np.where(is_tip[..., None, None], links_inverse_inertia[1], links_inverse_inertia[0])
+    arms_skew = np.cross(np.stack((particles[:, None] - centers, anchors - centers), axis=-2)[..., None, :], np.eye(3))
+    arms_mobility = arms_skew @ inverse_inertia[..., None, :, :] @ arms_skew.swapaxes(-1, -2)
+    levers = np.sqrt(np.linalg.eigvalsh(arms_mobility)[..., -1]).max(axis=-1)
+    links_mass = tensor_to_array(mass.per_rigid_link[0], dtype=np.float64)
     link_soft_mass = np.where(
         is_tip,
         (particle_mass[:, None] * weights)[is_tip].sum(),
         (particle_mass[:, None] * weights)[~is_tip & (link_idx >= 0)].sum(),
     )
-    link_weighted_radius = np.where(
+    link_weighted_lever = np.where(
         is_tip,
-        (particle_mass[:, None] * weights * radius)[is_tip].sum(),
-        (particle_mass[:, None] * weights * radius)[~is_tip & (link_idx >= 0)].sum(),
+        (particle_mass[:, None] * weights * levers)[is_tip].sum(),
+        (particle_mass[:, None] * weights * levers)[~is_tip & (link_idx >= 0)].sum(),
     )
-    inverse_inertia_norm = np.linalg.norm(np.linalg.inv(tensor_to_array(inertia)))
-    mobility = (weights * (link_soft_mass / 2.0 + radius * link_weighted_radius * inverse_inertia_norm)).sum(axis=-1)
+    link_mass = np.where(is_tip, links_mass[1], links_mass[0])
+    mobility = (weights * (link_soft_mass / link_mass + levers * link_weighted_lever)).sum(axis=-1)
     assert_allclose(diagnostics.stability_index, (1.0 + mobility.max()) * (scene.dt / 0.01) ** 2 / 2.0, tol=1e-6)
     human.set_attachment_params(damping_ratio=1.0)
     for _ in range(3):
@@ -304,7 +317,7 @@ def test_continuous_skin_binding(n_envs, heterogeneous, phase, skin_articulation
         rigid_velocity = human.part_rigid.get_links_vel(ref=gs.link_ref_frame.link_COM)
         rigid_angular_velocity = human.part_rigid.get_links_ang()
         rotation_world = geom.quat_to_R(human.part_rigid.get_links_quat())
-        inertia_world = rotation_world @ (0.001 * inertia) @ rotation_world.transpose(-1, -2)
+        inertia_world = rotation_world @ (0.001 * links_inertia) @ rotation_world.transpose(-1, -2)
         position_world = human.part_rigid.get_links_pos()
         target = 0.25 * (
             (initial @ rotation_world[..., 0, :, :].transpose(-1, -2)) + position_world[..., 0, None, :]
@@ -414,17 +427,23 @@ def test_rigid_mpm_muscle(show_viewer):
 
 @pytest.mark.required
 @pytest.mark.parametrize("substeps", [1, 10])
-def test_rigid_mpm_legacy_coupling(substeps, show_viewer):
+@pytest.mark.parametrize("n_envs", [0, 2])
+def test_rigid_mpm_legacy_coupling(substeps, n_envs, damped_hinge, show_viewer, tol):
     # This test is aimining at two things:
     # 1) When substep = 1, the rigid object should be affected by the MPM particles
     # 2) Regardless of substeps, as far as the substep dt is the same, they should give consistent results
     substep_dt = 4e-4
     horizon_substeps = 100
+    g = 9.81
 
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=substep_dt * substeps,
             substeps=substeps,
+            gravity=(0.0, 0.0, -g),
+        ),
+        rigid_options=gs.options.RigidOptions(
+            integrator=gs.integrator.approximate_implicitfast,
         ),
         mpm_options=gs.options.MPMOptions(
             lower_bound=(-0.5, -1.0, 0.0),
@@ -468,8 +487,18 @@ def test_rigid_mpm_legacy_coupling(substeps, show_viewer):
             vis_mode="particle",
         ),
     )
+    # A damped rotor outside the particle domain receives no reaction from the particles
+    rotor = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file=damped_hinge,
+        ),
+    )
 
-    scene.build()
+    scene.build(n_envs=n_envs)
+    rotor.set_dofs_velocity(2.0)
+    if n_envs > 0:
+        # The box of the first environment falls freely out of the particle domain, so that it receives no impulse
+        obj_rigid.set_pos((0.0, -2.0, 0.5), envs_idx=[0])
 
     horizon = horizon_substeps // substeps
     for i in range(horizon):
@@ -477,7 +506,15 @@ def test_rigid_mpm_legacy_coupling(substeps, show_viewer):
 
     # Check that the sand moved the box along the negative Y direction
     pos = tensor_to_array(obj_rigid.get_pos())
-    assert pos[1] + 0.25 < 0.0
+    assert (pos[..., 1] + 0.25 < 0.0).all()
+    if n_envs > 0:
+        n = horizon_substeps
+        assert_allclose(pos[0], (0.0, -2.0, 0.5 - g * substep_dt**2 * n * (n + 1) / 2), tol=tol)
+
+    # Implicit damping scales a spin about a principal axis by I / (I + h * d) on every substep
+    inertia = rotor.get_links_inertia()[-1, 2, 2] + rotor.get_dofs_armature()
+    decay = inertia / (inertia + substep_dt * rotor.get_dofs_damping())
+    assert_allclose(rotor.get_dofs_velocity(), 2.0 * decay**horizon_substeps, tol=tol)
 
 
 @pytest.mark.slow  # ~250s
@@ -833,7 +870,7 @@ def test_sap_fem_vs_robot(show_viewer):
 @pytest.mark.required
 @pytest.mark.parametrize("approaching", [False, True])
 @pytest.mark.parametrize("n_envs", [0, 2])
-def test_mpm_regions_do_not_weld(approaching, n_envs, show_viewer, tol):
+def test_mpm_regions_do_not_weld(approaching, n_envs, skin_articulation, show_viewer, tol):
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=1e-4,
@@ -868,12 +905,82 @@ def test_mpm_regions_do_not_weld(approaching, n_envs, show_viewer, tol):
                 )
             )
         pairs.append(entities)
+    # A skin with its main seam at x = 0.1, beside a single field that receives the same particles. The end caps give
+    # both arms a seam of their own, whose bands must bond neither the arms nor the caps to each other.
+    surface = trimesh.creation.box(extents=(0.48, 0.04, 0.04))
+    for _ in range(5):
+        surface = surface.subdivide()
+    vertices_x = surface.vertices[:, 0]
+    skin = scene.add_entity(
+        morph=gs.morphs.URDF(
+            file=skin_articulation,
+            pos=(0.1, 0.0, -0.25),
+        ),
+        material=gs.materials.Hybrid(
+            material_rigid=gs.materials.Rigid(),
+            material_soft=gs.materials.MPM.Elastic(
+                E=100.0,
+                nu=0.2,
+                rho=1000.0,
+            ),
+            skin=gs.options.HybridSkinOptions(
+                surface=surface,
+                regions={
+                    "region_names": ["base", "tip", "base_end", "tip_end"],
+                    "vertex_region": np.where(
+                        vertices_x > 0.0, np.where(vertices_x > 0.22, 3, 1), np.where(vertices_x < -0.22, 2, 0)
+                    ),
+                },
+            ),
+            # A loose attachment keeps its velocity change over the step below the tolerance of the comparisons
+            binding=gs.options.HybridBindingOptions(
+                timeconst=1000.0,
+                damping_ratio=0.0,
+            ),
+        ),
+    )
+    continuum = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.1, 0.0, 0.25),
+            size=(0.48, 0.04, 0.04),
+        ),
+        material=gs.materials.MPM.Elastic(
+            E=100.0,
+            nu=0.2,
+            rho=1000.0,
+            sampler="regular",
+        ),
+    )
     scene.build(n_envs=n_envs)
+    center = torch.tensor((0.1, 0.0, -0.25), dtype=gs.tc_float, device=gs.device)
+    rest = torch.tensor(skin.part_soft.init_particles, device=gs.device) - center
+    # A first step at rest with the straight skin shifted by 0.16 along -x lays both seam bands over the grid nodes
+    # where the folded arms touch below, so any seam marks outliving that step would bond the arms there.
+    skin.part_soft.set_particles_pos(center + rest + rest.new_tensor((-0.16, 0.0, 0.0)))
+    scene.step()
     speed = 0.1 if approaching else -0.1
     for entities in pairs:
         for i, entity in enumerate(entities):
             entity.set_particles_vel(((-1) ** i * speed, (-1) ** i, 0.0))
     initial_positions = [[entity.get_particles_pos() for entity in entities] for entities in pairs]
+    # Fold the skin about its seam into a U, an arc of radius 0.025 closed by two arms whose inner particle layers lie
+    # 0.03 apart. The continuum receives the same particles 16 cells higher, on identical grid weights.
+    arc_length = 0.0125 * np.pi
+    radii = 0.025 - rest[:, 1]
+    angles = rest[:, 0].clamp(-arc_length, arc_length) / 0.025
+    folded = center + torch.stack(
+        (
+            radii * torch.cos(angles) - (rest[:, 0].abs() - arc_length).clamp_min(0.0),
+            radii * torch.sin(angles),
+            rest[:, 2],
+        ),
+        dim=-1,
+    )
+    skin.part_soft.set_particles_pos(folded)
+    continuum.set_particles_pos(folded + folded.new_tensor((0.0, 0.0, 0.5)))
+    skin_initial_velocity = torch.where(rest[:, :1] < 0.0, 1.0, -1.0) * rest.new_tensor((0.0, speed, 1.0))
+    skin.part_soft.set_particles_vel(skin_initial_velocity)
+    continuum.set_particles_vel(skin_initial_velocity)
     scene.step()
     for entities, positions in zip(pairs, initial_positions):
         velocities = [entity.get_particles_vel() for entity in entities]
@@ -895,3 +1002,26 @@ def test_mpm_regions_do_not_weld(approaching, n_envs, show_viewer, tol):
                     positions[i] + scene.dt * torch.tensor(expected, dtype=gs.tc_float, device=gs.device),
                     tol=tol,
                 )
+    # The seam moves as one continuum, whereas the arm particles beyond 0.16 from it, out of reach of the grid nodes
+    # of the seam bands, contact the other arm as separate entities do.
+    skin_velocity = skin.part_soft.get_particles_vel()
+    is_seam = rest[:, 0].abs() < 0.02
+    assert_allclose(skin_velocity[..., is_seam, :], continuum.get_particles_vel()[..., is_seam, :], tol=tol)
+    for side in (-1.0, 1.0):
+        is_far = side * rest[:, 0] > 0.16
+        if approaching:
+            assert (skin_velocity[..., is_far, 1].abs() < speed).all()
+            impulse_per_mass = skin_initial_velocity[is_far].mean(dim=-2) - skin_velocity[..., is_far, :].mean(dim=-2)
+            assert_allclose(
+                impulse_per_mass[..., 2], skin.part_soft.material.friction * impulse_per_mass[..., 1], tol=tol
+            )
+        else:
+            assert_allclose(skin_velocity[..., is_far, :], skin_initial_velocity[is_far], tol=tol)
+    mass = skin.get_mass_breakdown()
+    particle_mass = skin.get_binding_diagnostics().particle_mass
+    rigid_momentum = (
+        skin.part_rigid.get_links_vel(ref=gs.link_ref_frame.link_COM) * mass.per_rigid_link[..., None]
+    ).sum(dim=-2)
+    soft_momentum = (skin_velocity * particle_mass[:, None]).sum(dim=-2)
+    initial_momentum = (skin_initial_velocity * particle_mass[:, None]).sum(dim=-2)
+    assert_allclose(rigid_momentum + soft_momentum, initial_momentum, tol=tol)

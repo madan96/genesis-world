@@ -303,7 +303,8 @@ class Collider:
 
         # 'contact_data_cache' is not used in Quadrants kernels, so keep it outside of the collider state / info
         self._contact_data_cache: dict[
-            tuple[bool, bool, bool, bool], dict[str, torch.Tensor | tuple[torch.Tensor]]
+            tuple[bool, bool, bool, bool],
+            dict[str, torch.Tensor | np.ndarray | tuple[torch.Tensor, ...] | tuple[np.ndarray, ...]],
         ] = {}
 
         # GPU core count (used by split-narrowphase chunking + the cooperative dedup dispatch gate).
@@ -1059,12 +1060,15 @@ class Collider:
     def get_contacts(
         self, as_tensor: bool = True, to_torch: bool = True, keep_batch_dim: bool = False, is_padded: bool = False
     ):
+        n_envs = self._solver.n_envs
+        # A dense batched result always holds the batch axis, so both values of 'keep_batch_dim' share one cache entry.
+        keep_batch_dim = keep_batch_dim or (as_tensor and n_envs > 0)
+
         # Early return if already pre-computed
         contact_data = self._contact_data_cache.setdefault((as_tensor, to_torch, keep_batch_dim, is_padded), {})
         if contact_data:
             return contact_data.copy()
 
-        n_envs = self._solver.n_envs
         # When pruning and spatial sort are both statically disabled, contact_sort_idx is guaranteed to stay at the
         # identity permutation, so the physical layout of contact_data already matches the logical order. In that
         # case the zero-copy fast path returns torch views over contact_data storage truncated to n_contacts_max.

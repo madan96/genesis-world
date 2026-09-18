@@ -246,9 +246,12 @@ class RigidGeom(RBC):
         """Compute signed distance gradients from closest points, using finite differences at surface nodes.
 
         The direction sign(distance) * (point - closest_point) / |point - closest_point| is the gradient where the
-        distance field is differentiable. At a medial axis it selects one closest surface branch. Surface nodes
-        within the closest-point roundoff scale use the per-axis SDF cell stencil. Arithmetic stays in libigl's
-        double precision until the result is converted to the simulation precision.
+        distance field is differentiable. At a medial axis it selects one closest surface branch. A surface node, whose
+        distance to its closest point is at most sqrt(eps) times the largest absolute vertex coordinate, takes a central
+        difference of the signed distance instead, stepping 'sdf_grad_delta' (one hundredth of the SDF cell size) along
+        each axis. That bound lies far above the roundoff of libigl's double precision closest points, so every
+        direction computed from a longer difference keeps at least half its significant digits. Arithmetic stays in
+        libigl's double precision until the result is converted to the simulation precision.
         """
         gradients = query_points - closest_points
         lengths = np.linalg.norm(gradients, axis=-1)

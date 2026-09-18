@@ -1,7 +1,7 @@
 """Passive scalar-joint forces and coupled soft limits for articulated entities."""
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, NamedTuple
 
 import numpy as np
 import torch
@@ -38,6 +38,7 @@ class PassiveJointInfo:
     kind: ClassVar[array_class.DataKind] = array_class.DataKind.INFO
 
     dofs_idx: qd.Tensor = array_class.of_kind(array_class.DataKind.CONSTANT)
+    friction_vel_eps: qd.Tensor = array_class.of_kind(array_class.DataKind.CONSTANT)
     q_neutral: qd.Tensor
     k_neutral: qd.Tensor
     soft_lo: qd.Tensor
@@ -80,6 +81,14 @@ class CoupledLimitState:
 
     violation: qd.Tensor
     potential_energy: qd.Tensor
+
+
+class PassiveJointForces(NamedTuple):
+    """Forces of a passive joint model at one state, each of shape ``(B, n_dofs)``."""
+
+    passive: torch.Tensor
+    limit: torch.Tensor
+    applied: torch.Tensor
 
 
 @dataclass
@@ -165,25 +174,33 @@ def kernel_coupled_limit(
 
 @qd.kernel
 def kernel_passive_joints(
-    friction_vel_eps: float,
     dyn_state: array_class.DynState,
     passive_state: PassiveJointState,
+    rigid_info: array_class.RigidInfo,
     passive_info: PassiveJointInfo,
+    rigid_config: qd.template(),
     is_apply: qd.template(),
+    has_coupled_limits: qd.template(),
 ):
+    EPS = rigid_info.EPS[None]
+    friction_vel_eps = passive_info.friction_vel_eps[None]
+
+    qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
     for i_d_, i_b in qd.ndrange(passive_info.dofs_idx.shape[0], dyn_state.dofs.pos.shape[1]):
         i_d = passive_info.dofs_idx[i_d_]
         position = dyn_state.dofs.pos[i_d, i_b]
         velocity = dyn_state.dofs.vel[i_d, i_b]
         delta = position - passive_info.q_neutral[i_d_, i_b]
         stiffness = passive_info.k_neutral[i_d_, i_b]
-        passive_force = (
-            -stiffness * delta
-            - passive_info.damping[i_d_, i_b] * velocity
-            - passive_info.friction[i_d_, i_b] * qd.tanh(velocity / friction_vel_eps)
-        )
+        damping = passive_info.damping[i_d_, i_b]
+        friction = passive_info.friction[i_d_, i_b]
+        velocity_normalized = velocity / friction_vel_eps
+        tanh_velocity = qd.tanh(velocity_normalized)
+        passive_force = -stiffness * delta - damping * velocity - friction * tanh_velocity
         energy = 0.5 * stiffness * delta**2
-        limit_force = passive_state.coupled_force[i_d_, i_b]
+        limit_force = gs.qd_float(0.0)
+        if qd.static(has_coupled_limits):
+            limit_force = passive_state.coupled_force[i_d_, i_b]
         exponent = passive_info.soft_exponent[i_d_, i_b]
         stiffness_limit = passive_info.k_soft[i_d_, i_b]
         lower_excess = qd.max(passive_info.soft_lo[i_d_, i_b] - position, 0.0)
@@ -200,6 +217,25 @@ def kernel_passive_joints(
         passive_state.potential_energy[i_d_, i_b] = energy
         if qd.static(is_apply):
             dyn_state.dofs.qf_passive_model[i_d, i_b] += applied_force
+            # The substep integrates the velocity dependence of the applied force implicitly through the slope of its
+            # chord between rest and the current velocity: applied(v) = applied(0) - slope * v holds exactly, so the
+            # damping and friction can slow a DOF down to rest but never reverse its velocity, whatever the substep and
+            # the inertia. The tangent slope vanishes where the friction saturates and leaves that regime explicit.
+            # The chord is computed from the unclamped expression where the clamp is inactive at both ends, which is
+            # exact near rest, and lies within [0, damping + friction / friction_vel_eps].
+            elastic_force = limit_force - stiffness * delta
+            slope = gs.qd_float(0.0)
+            if qd.abs(elastic_force) < force_limit and qd.abs(passive_force + limit_force) < force_limit:
+                tanh_ratio = gs.qd_float(1.0)
+                if qd.abs(velocity_normalized) > EPS:
+                    tanh_ratio = tanh_velocity / velocity_normalized
+                slope = damping + friction * tanh_ratio / friction_vel_eps
+            elif qd.abs(velocity) > EPS:
+                rest_force = qd.math.clamp(elastic_force, -force_limit, force_limit)
+                slope = qd.math.clamp(
+                    (rest_force - applied_force) / velocity, 0.0, damping + friction / friction_vel_eps
+                )
+            dyn_state.dofs.damping_passive_model[i_d, i_b] += slope
 
 
 class PassiveJointModel:
@@ -210,6 +246,12 @@ class PassiveJointModel:
     model applies. Joint coordinates are the values returned by ``get_dofs_position()`` (radians for revolute joints
     and metres for prismatic joints). Free and spherical joints need a rotational potential on their configuration
     manifold and cannot be selected here.
+
+    Damping and friction are integrated implicitly, like native joint damping: every substep adds to the implicit
+    mass-matrix diagonal of each DOF ``substep_dt`` times the slope of the chord of the applied force between rest and
+    the current velocity. They slow a DOF down to rest without reversing its velocity, whatever its inertia and the
+    substep. Under the ``approximate_implicitfast`` integrator ``get_mass_mat()`` includes this term like it includes
+    native damping, and under the other integrators the factor from ``get_mass_mat(decompose=True)`` includes it.
 
     Parameters are zero by default, with infinite soft bounds and force limit, and set after build. Each value can vary
     by environment and survives ``scene.reset()``. Solver checkpoints include these parameters. All force getters
@@ -307,6 +349,7 @@ class PassiveJointModel:
         shape = (self.n_dofs, self._solver._B)
         self._info = PassiveJointInfo(
             array_class.V(gs.qd_int, (self.n_dofs,)),
+            array_class.V_SCALAR_FROM(dtype=gs.qd_float, value=self._friction_vel_eps),
             *(array_class.V(gs.qd_float, shape) for _ in range(9)),
         )
         self._info.dofs_idx.from_numpy(self.dofs_idx)
@@ -464,18 +507,26 @@ class PassiveJointModel:
         self._solver.update_forward_pos()
         if gs.device.type == "mps":
             torch.mps.synchronize()
-        self._state.coupled_force.fill(0.0)
-        for group in self._groups:
-            kernel_coupled_limit(
-                self._solver.dyn_state,
-                self._state,
-                group.state,
-                self._info,
-                group.info,
-                is_ellipsoid=group.kind == "ellipsoid",
-            )
+        # Only the group kernels write coupled_force, so a model without groups leaves it at zero and skips reading it.
+        if self._groups:
+            self._state.coupled_force.fill(0.0)
+            for group in self._groups:
+                kernel_coupled_limit(
+                    self._solver.dyn_state,
+                    self._state,
+                    group.state,
+                    self._info,
+                    group.info,
+                    is_ellipsoid=group.kind == "ellipsoid",
+                )
         kernel_passive_joints(
-            self._friction_vel_eps, self._solver.dyn_state, self._state, self._info, is_apply=is_apply
+            self._solver.dyn_state,
+            self._state,
+            self._solver.rigid_info,
+            self._info,
+            self._solver.rigid_config,
+            is_apply=is_apply,
+            has_coupled_limits=bool(self._groups),
         )
 
     def get_passive_dofs_force(self) -> torch.Tensor:
@@ -497,6 +548,17 @@ class PassiveJointModel:
         """Return the current force the model applies after ``force_limit``, shape ``(B, n_dofs)``."""
         self._evaluate()
         return qd_to_torch(self._state.applied_force, transpose=True, copy=True)
+
+    def get_dofs_forces(self) -> PassiveJointForces:
+        """Return the passive, limit and applied forces of the three getters above from one evaluation of the current
+        state, cheaper than calling them in turn.
+        """
+        self._evaluate()
+        return PassiveJointForces(
+            qd_to_torch(self._state.passive_force, transpose=True, copy=True),
+            qd_to_torch(self._state.limit_force, transpose=True, copy=True),
+            qd_to_torch(self._state.applied_force, transpose=True, copy=True),
+        )
 
     def get_coupled_limit_violation(self) -> torch.Tensor:
         """Return current excess per group, shape ``(B, n_groups)`` (maximum face excess for polytopes)."""

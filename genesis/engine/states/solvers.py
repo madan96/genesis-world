@@ -86,14 +86,21 @@ class SimState(RBC):
         s_global,
         f_local,
         solvers,
+        *,
+        include_observations: bool = True,
     ):
+        """Capture the solver states, and with 'include_observations' owned copies of the sensor and contact state.
+
+        Without observations, 'sensor_state' and 'contact_state' are None and restoring the state clears the sensor
+        histories and contact accumulators instead, as a bare 'Scene.reset' does.
+        """
         self._scene = scene
         self._s_global = s_global
-        self._sensor_state = scene.sim._sensor_manager.get_state()
+        self._sensor_state = scene.sim._sensor_manager.get_state() if include_observations else None
         self._solvers_state = list()
         for solver in solvers:
             self._solvers_state.append(solver.get_state(f_local))
-        self._contact_state = scene.sim.get_contact_state()
+        self._contact_state = scene.sim.get_contact_state() if include_observations else None
 
     @property
     def scene(self):
@@ -109,12 +116,18 @@ class SimState(RBC):
 
     @property
     def sensor_state(self):
-        """Owned electronics and sensor histories; future random draws use the caller-controlled torch RNG."""
+        """Owned electronics and sensor histories, or None when captured without observations.
+
+        Restoring them rewinds no random number generator. Future sensor noise, jitter and hardware randomization draw
+        from the torch RNG, which the caller seeds; the 'probe_radius_noise' of probe sensors draws from the Quadrants
+        kernel RNG, which only the 'seed' of 'gs.init' sets.
+        """
         return self._sensor_state
 
     @property
-    def contact_state(self) -> ContactObservationState:
-        """Owned contact accumulators and hybrid attachment diagnostics on the simulation device."""
+    def contact_state(self) -> ContactObservationState | None:
+        """Owned contact accumulators and hybrid attachment diagnostics on the simulation device, or None when
+        captured without observations."""
         return self._contact_state
 
     def __iter__(self):

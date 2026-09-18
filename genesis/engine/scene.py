@@ -636,14 +636,13 @@ class Scene(RBC):
         return self._contact_reader.contributions(source)
 
     @gs.assert_built
-    def get_links_contact_wrench(
-        self, source: ContactSource = "all", *, reference=(0.0, 0.0, 0.0)
-    ) -> ContactLinkWrenches:
+    def get_links_contact_wrench(self, source: ContactSource = "all", *, reference=None) -> ContactLinkWrenches:
         """Return exact owned contact reductions for all rigid links, even on row overflow.
 
         ``reference`` is a world-space point in meters, broadcastable to
-        [B, n_links, 3]. Force/torque use N and N*m. Both source intervals are
-        retained; see ContactLinkWrenches for the mixed temporal convention.
+        [B, n_links, 3], about which torque and angular impulse are taken. None
+        selects the world origin. Force/torque use N and N*m. Both source intervals
+        are retained; see ContactLinkWrenches for the mixed temporal convention.
         Internal hybrid attachment forces are excluded.
         """
         return self._contact_reader.wrenches(source, reference=reference)
@@ -986,8 +985,10 @@ class Scene(RBC):
             If this is given, the scene's registerered initial state will be updated to this state.
             An explicit state restores contact observations, attachment diagnostics, sensor histories and electronics
             for the selected environments. With None, contact observations and sensor histories clear and configured
-            hardware randomization is resampled. Future random draws use the caller-controlled torch RNG; restoring a
-            state does not rewind that shared RNG.
+            hardware randomization is resampled. Restoring a state rewinds no random number generator (RNG). Future
+            sensor noise, jitter and hardware randomization draw from the torch RNG, which the caller seeds. The
+            'probe_radius_noise' of probe sensors draws from the Quadrants kernel RNG instead, which only the 'seed' of
+            'gs.init' sets.
         envs_idx : None | array_like, optional
             The indices of the environments. If None, all environments will be considered. Defaults to None.
         """
@@ -1012,7 +1013,8 @@ class Scene(RBC):
                     self._init_state = state
             self._sim.reset(state, envs_idx, restore_observation_state=restore_observation_state)
         else:
-            self._init_state = self._get_state()
+            # A bare reset clears observations instead of restoring them, so the build state needs no copy of them.
+            self._init_state = self._get_state(include_observations=False)
         self._restart()
 
     def _restart(self):
@@ -1071,8 +1073,8 @@ class Scene(RBC):
         self._sim._steps[:] = steps
         return snapshot
 
-    def _get_state(self):
-        return self._sim.get_state()
+    def _get_state(self, *, include_observations: bool = True):
+        return self._sim.get_state(include_observations=include_observations)
 
     @gs.assert_built
     def get_state(self):

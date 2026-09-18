@@ -2086,6 +2086,9 @@ class DofsState:
     qf_bias: qd.Tensor
     qf_passive: qd.Tensor
     qf_passive_model: qd.Tensor = of_kind(DataKind.SCRATCH)
+    # Velocity coefficient the passive joint models add to the implicit damping of each DOF, written with
+    # qf_passive_model (see kernel_passive_joints).
+    damping_passive_model: qd.Tensor = of_kind(DataKind.SCRATCH)
     qf_actuator: qd.Tensor
     qf_applied: qd.Tensor
     act_length: qd.Tensor
@@ -2123,6 +2126,7 @@ def get_dofs_state(solver):
         qf_bias=V(dtype=gs.qd_float, shape=shape, needs_grad=requires_grad),
         qf_passive=V(dtype=gs.qd_float, shape=shape, needs_grad=requires_grad),
         qf_passive_model=V(dtype=gs.qd_float, shape=maybe_shape(shape, solver.rigid_config.has_passive_joints)),
+        damping_passive_model=V(dtype=gs.qd_float, shape=maybe_shape(shape, solver.rigid_config.has_passive_joints)),
         qf_actuator=V(dtype=gs.qd_float, shape=shape, needs_grad=requires_grad),
         qf_applied=V(dtype=gs.qd_float, shape=shape, needs_grad=requires_grad),
         act_length=V(dtype=gs.qd_float, shape=shape, needs_grad=requires_grad),

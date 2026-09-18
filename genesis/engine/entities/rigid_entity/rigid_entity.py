@@ -3252,6 +3252,8 @@ class RigidEntity(KinematicEntity):
         """
         Returns net force applied on each links due to direct external contacts.
 
+        The environment dimension is dropped for nonparallel scenes, unlike 'get_links_contact_wrench'.
+
         Returns
         -------
         entity_links_force : torch.Tensor, shape (n_links, 3) or (n_envs, n_links, 3)
@@ -3272,32 +3274,16 @@ class RigidEntity(KinematicEntity):
         return self.scene.get_contact_contributions(source).select(entity_idx=self.idx)
 
     @gs.assert_built
-    def get_links_contact_wrench(
-        self, source: "ContactSource" = "all", *, reference=(0.0, 0.0, 0.0)
-    ) -> "ContactLinkWrenches":
+    def get_links_contact_wrench(self, source: "ContactSource" = "all", *, reference=None) -> "ContactLinkWrenches":
         """Return exact owned external contact reductions for this entity's links.
 
-        Shapes always include [B, n_links]. ``reference`` is a world-space point
-        in meters broadcastable to [B, n_links, 3]; torque uses N*m.
-        See Scene.get_links_contact_wrench for temporal and overflow semantics.
+        Shapes always include [B, n_links], with B = max(n_envs, 1) (see ContactLinkWrenches). ``reference`` is a
+        world-space point in meters broadcastable to [B, n_links, 3], about which torque and angular impulse are
+        taken. None selects the world origin. See Scene.get_links_contact_wrench for temporal and overflow semantics.
         """
-        from dataclasses import fields
-
-        from genesis.engine.contact_contributions import ContactLinkWrenches
-
-        values = self.scene.get_links_contact_wrench(source)
-        data = {}
-        for field in fields(values):
-            value = getattr(values, field.name)
-            data[field.name] = (
-                value if field.name.endswith("interval") else value[:, self.link_start : self.link_end].clone()
-            )
-        data["reference"] = torch.broadcast_to(
-            torch.as_tensor(reference, dtype=gs.tc_float, device=gs.device), data["force"].shape
-        ).clone()
-        data["torque"] -= data["reference"].cross(data["force"], dim=-1)
-        data["angular_impulse"] -= data["reference"].cross(data["impulse"], dim=-1)
-        return ContactLinkWrenches(**data)
+        return self._scene._contact_reader.wrenches(
+            source, reference=reference, links_idx=slice(self.link_start, self.link_end)
+        )
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- friction ---------------------------------------

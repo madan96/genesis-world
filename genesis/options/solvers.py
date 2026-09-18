@@ -108,6 +108,21 @@ class LegacyCouplerOptions(BaseCouplerOptions):
         Whether to enable coupling between FEM and MPM solvers. Defaults to True.
     fem_sph : bool, optional
         Whether to enable coupling between FEM and SPH solvers. Defaults to True.
+    enable_contact_telemetry : bool | None, optional
+        Whether to record MPM-to-rigid contacts for 'Scene.get_contact_contributions' and
+        'Scene.get_links_contact_wrench'. Recording costs a little time per contact and the memory of the contact
+        buffer. None enables it for forward simulation without CPIC and disables it otherwise. True raises with CPIC or
+        gradient simulation, where it is unavailable. Defaults to None.
+    contact_buffer_capacity : int, optional
+        Number of MPM contacts kept per environment and scene step. One contact is one grid node against one coupled
+        geometry during one substep, so a resting footprint of N grid nodes fills about N * substeps entries per step.
+        Contacts beyond the capacity are dropped from the per-contact record and reported as incomplete, while per-link
+        wrenches stay exact. Memory and read time grow with the capacity. Defaults to 16384.
+    rigid_pushout_speed : float, optional
+        Largest speed in m/s at which MPM material that penetrates a rigid geometry is pushed back out along the
+        surface normal, the rigid link receiving the opposite impulse. A positive value recovers deep penetration
+        within a few substeps but adds kinetic energy to the material. 0 leaves the collision response unchanged and
+        costs nothing. Defaults to 0.0.
     """
 
     rigid_mpm: StrictBool = True

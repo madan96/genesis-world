@@ -48,6 +48,12 @@ class ContactContributions:
     Rigid rows have region_b and substep -1. ``interval`` is in
     seconds; ``area`` is a time-weighted grid footprint in m^2 (zero for rigid
     point contacts), not a unique surface union. Relative velocity is B minus A.
+
+    A hybrid row is one MPM grid node against one coupled geometry during one
+    substep. Its position is that grid node, where the rigid link also receives
+    the impulse. Nodes carrying MPM mass lie within about one grid spacing of the
+    rigid surface, so moments about a point of that surface and the center of
+    pressure carry an offset of the same order.
     """
 
     source: torch.Tensor
@@ -113,7 +119,12 @@ class ContactContributions:
 class ContactLinkWrenches:
     """Exact owned external contact reductions over rigid links, including overflow.
 
-    Vector fields have shape [B, n_links, 3]; scalar link fields [B, n_links].
+    Vector fields have shape [B, n_links, 3] and scalar link fields [B, n_links],
+    where B is max(n_envs, 1): nonparallel scenes keep the environment dimension,
+    unlike RigidEntity.get_links_net_contact_force. Every field is allocated
+    by the call that returns it and owned by the caller. Per-link fields may be
+    non-contiguous, non-overlapping views into those allocations, so reshape
+    them with ``reshape`` rather than ``view``.
     Force is in N, torque in N*m about ``reference`` (world coordinates, m).
     Impulse/angular_impulse use N*s and N*m*s about the same reference.
     ``rigid_interval`` and ``hybrid_interval`` are [B] seconds and retain the
@@ -288,28 +299,45 @@ class ContactReader:
             data[field.name] = sum(values) if field.name in ("count", "dropped_count") else torch.cat(values, dim=1)
         return ContactContributions(**data)
 
-    def wrenches(self, source: ContactSource = "all", *, reference=(0.0, 0.0, 0.0)) -> ContactLinkWrenches:
+    def wrenches(
+        self, source: ContactSource = "all", *, reference=None, links_idx: slice = slice(None)
+    ) -> ContactLinkWrenches:
+        """Reduce the selected contact sources per rigid link, then keep the links selected by ``links_idx``.
+
+        ``reference`` is a world-space point broadcastable to the selected [B, n_links, 3]. With None the moments stay
+        about the world origin, where both sources accumulate them.
+        """
         telemetry = self._telemetry(source)
+        solver = self.scene.rigid_solver
         shape = (self.scene.sim._B, self.link_entities.numel())
-        vector = torch.zeros((*shape, 3), dtype=gs.tc_float, device=gs.device)
-        force, torque, impulse, angular_impulse, position_weighted = (vector.clone() for _ in range(5))
-        normal_force, area, peak = (vector[..., 0].clone() for _ in range(3))
+        force, torque, impulse, angular_impulse, position_weighted = torch.zeros(
+            (5, *shape, 3), dtype=gs.tc_float, device=gs.device
+        ).unbind(0)
+        normal_force, area, peak = torch.zeros((3, *shape), dtype=gs.tc_float, device=gs.device).unbind(0)
         rigid_interval = torch.zeros(shape[0], dtype=gs.tc_float, device=gs.device)
         hybrid_interval = torch.zeros_like(rigid_interval)
-        if source != "hybrid" and self.scene.rigid_solver.is_active:
-            rows = self._rigid()
-            rigid_interval.fill_(self.scene.rigid_solver.substep_dt)
-            pressure = rows.normal_force.clamp(min=0)
-            for link, sign in ((rows.link_a, 1.0), (rows.link_b, -1.0)):
+        if source != "hybrid" and solver.is_active:
+            # The reduction reads the padded collider rows directly: the per-row record built by 'contributions' adds
+            # relative velocities and participant lookups that no link sum needs. Rows past each environment's contact
+            # count hold stale values, so their force, position and pressure are selected away before scattering
+            # (selection rather than multiplication, so a non-finite stale value cannot leak into the sums).
+            raw = solver.collider.get_contacts(as_tensor=True, to_torch=True, keep_batch_dim=True, is_padded=True)
+            is_valid = torch.arange(raw["link_a"].shape[1], device=gs.device)[None] < raw["n_contacts"][:, None]
+            force_on_a = torch.where(is_valid[..., None], -raw["force"], 0.0)
+            position = torch.where(is_valid[..., None], raw["position"], 0.0)
+            moment_on_a = position.cross(force_on_a, dim=-1)
+            pressure = torch.where(is_valid, (force_on_a * raw["normal"]).sum(dim=-1).clamp(min=0), 0.0)
+            for link, sign in ((raw["link_a"], 1.0), (raw["link_b"], -1.0)):
                 idx = link.long().clamp(min=0)
                 idx_vector = idx[..., None].expand(-1, -1, 3)
-                force.scatter_add_(1, idx_vector, sign * rows.force)
-                torque.scatter_add_(1, idx_vector, sign * rows.position.cross(rows.force, dim=-1))
-                impulse.scatter_add_(1, idx_vector, sign * rows.impulse)
-                angular_impulse.scatter_add_(1, idx_vector, sign * rows.position.cross(rows.impulse, dim=-1))
+                force.scatter_add_(1, idx_vector, sign * force_on_a)
+                torque.scatter_add_(1, idx_vector, sign * moment_on_a)
                 normal_force.scatter_add_(1, idx, pressure)
-                position_weighted.scatter_add_(1, idx_vector, rows.position * pressure[..., None])
+                position_weighted.scatter_add_(1, idx_vector, position * pressure[..., None])
                 peak.scatter_reduce_(1, idx, pressure, reduce="amax", include_self=True)
+            rigid_interval.fill_(solver.substep_dt)
+            impulse.add_(force, alpha=solver.substep_dt)
+            angular_impulse.add_(torque, alpha=solver.substep_dt)
         if telemetry is not None:
             links = telemetry.links
             hybrid_interval = qd_to_torch(telemetry.interval, transpose=True, copy=True)
@@ -324,11 +352,19 @@ class ContactReader:
             position_weighted += qd_to_torch(links.position_weighted, transpose=True) * inverse[..., None]
             area += qd_to_torch(links.area_time, transpose=True) * inverse
             peak = torch.maximum(peak, qd_to_torch(links.peak_normal_impulse, transpose=True) * inverse)
-        reference = torch.broadcast_to(
-            torch.as_tensor(reference, dtype=gs.tc_float, device=gs.device), vector.shape
-        ).clone()
-        torque -= reference.cross(force, dim=-1)
-        angular_impulse -= reference.cross(impulse, dim=-1)
+        # Every per-link tensor is allocated by this call, so the selected links are returned as views of it.
+        force, torque, impulse, angular_impulse, normal_force, position_weighted, area, peak = (
+            value[:, links_idx]
+            for value in (force, torque, impulse, angular_impulse, normal_force, position_weighted, area, peak)
+        )
+        if reference is None:
+            reference = torch.zeros_like(force)
+        else:
+            reference = torch.broadcast_to(
+                torch.as_tensor(reference, dtype=gs.tc_float, device=gs.device), force.shape
+            ).clone()
+            torque = torque - reference.cross(force, dim=-1)
+            angular_impulse = angular_impulse - reference.cross(impulse, dim=-1)
         denominator = torch.where(normal_force > 0, normal_force, 1.0)
         return ContactLinkWrenches(
             force,

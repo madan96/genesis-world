@@ -7,7 +7,7 @@ import trimesh
 
 import genesis as gs
 
-from ..utils.assertions import assert_allclose
+from ..utils.assertions import assert_allclose, assert_equal
 
 
 @pytest.mark.required
@@ -55,6 +55,10 @@ def test_grid_state_reset(grid_mode, show_viewer):
     before = entity.get_particles_pos().clone()
     diagnostics = solver.get_grid_diagnostics()
     assert_allclose(diagnostics.active_particles, [entity.n_particles, entity.n_particles, 0], atol=0)
+    expected_lower, expected_upper = before.amin(dim=1), before.amax(dim=1)
+    expected_lower[2], expected_upper[2] = math.inf, -math.inf
+    assert_equal(diagnostics.occupancy_lower, expected_lower)
+    assert_equal(diagnostics.occupancy_upper, expected_upper)
     selection = torch.tensor([True, False, True], device=gs.device)
     scene.reset(snapshot, envs_idx=selection)
     assert_allclose(entity.get_particles_pos(envs_idx=[1]), before[1:2], atol=1e-7)

@@ -87,12 +87,17 @@ def test_solver_taxel_many_contact_reduction(n_envs, show_viewer):
 
 @pytest.mark.required
 @pytest.mark.parametrize("n_envs", [0, 2])
-def test_solver_taxel_rigid_wrench_frames_and_support(n_envs, show_viewer):
+def test_solver_taxel_wrench_frames_and_support(n_envs, show_viewer):
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=0.005,
             substeps=2,
             gravity=(0.0, 0.0, -10.0),
+        ),
+        mpm_options=gs.options.MPMOptions(
+            lower_bound=(-0.4, -0.4, -0.05),
+            upper_bound=(-0.1, -0.1, 0.25),
+            grid_density=64,
         ),
         show_viewer=show_viewer,
     )
@@ -106,6 +111,17 @@ def test_solver_taxel_rigid_wrench_frames_and_support(n_envs, show_viewer):
         material=gs.materials.Rigid(
             rho=2.0 / (4.0 * math.pi * 0.1**3 / 3.0),
             friction=0.01,
+        ),
+    )
+    scene.add_entity(
+        gs.morphs.Box(
+            size=(0.1, 0.1, 0.05),
+            pos=(-0.25, -0.25, 0.03),
+        ),
+        material=gs.materials.MPM.Elastic(
+            E=1e4,
+            rho=1000,
+            sampler="regular",
         ),
     )
     # +x of the link points down after the 90-degree rotation around y. The third probe is inactive padding.
@@ -130,6 +146,32 @@ def test_solver_taxel_rigid_wrench_frames_and_support(n_envs, show_viewer):
         )
     )
     excluded = scene.add_sensor(gs.sensors.SolverContactTaxel(**{**shared, "filter_entities": (sphere.idx,)}))
+    # Taxel centers recessed 15 mm along the normal, at 5 mm and 15 mm from the contact within the taxel plane.
+    recessed = scene.add_sensor(
+        gs.sensors.SolverContactTaxel(
+            **{
+                **shared,
+                "probe_local_pos": ((0.085, -0.005, 0.0), (0.085, 0.015, 0.0), (0.1, 0.0, 0.0)),
+                "probe_radius": (0.02, 0.02, 0.0),
+            },
+        )
+    )
+    world_offset = scene.add_sensor(
+        gs.sensors.SolverContactTaxel(
+            **shared,
+            frame="world",
+            hardware_profile=gs.sensors.TactileHardwareProfile(offset=0.2),
+        )
+    )
+    # Default sources: the soft box loads the first floor taxel through hybrid contacts, the sphere loads the second.
+    mixed = scene.add_sensor(
+        gs.sensors.SolverContactTaxel(
+            entity_idx=floor.idx,
+            probe_local_pos=((-0.25, -0.25, 0.0), (0.3, 0.2, 0.0)),
+            probe_local_normal=(0.0, 0.0, 1.0),
+            probe_radius=0.1,
+        )
+    )
     scene.build(n_envs=n_envs)
     for _ in range(80):
         scene.step()
@@ -147,14 +189,50 @@ def test_solver_taxel_rigid_wrench_frames_and_support(n_envs, show_viewer):
     assert_allclose(fallback.read_ground_truth().couple, ((0, 0, -load * 0.03), (0, 0, 0), (0, 0, 0)), atol=0.001)
     assert_equal(excluded.read_ground_truth().force, 0)
     assert_equal(excluded.read_ground_truth().couple, 0)
+    # The support is a disc on the taxel plane: the offset along the normal leaves the weights unchanged.
+    shares = torch.tensor(((1 - 0.25**2) ** 2, (1 - 0.75**2) ** 2, 0.0), dtype=gs.tc_float, device=gs.device)
+    shares /= shares.sum()
+    assert_allclose(recessed.read_ground_truth().force[..., 0], -load * shares, atol=0.01)
+    assert_allclose(recessed.read_ground_truth().force[..., 1:], 0, atol=0.01)
+    # The normal-force offset acts along the link-frame taxel normal before the output rotates into the world frame.
+    assert_allclose(world_offset.read().force - world_data.force, ((0, 0, 0.2), (0, 0, 0.2), (0, 0, 0)), atol=1e-5)
+    assert_allclose(world_offset.read().couple, world_data.couple, atol=1e-6)
     assert_allclose(local.normal_force(ground_truth=True), (load / 2, load / 2, 0), atol=0.01)
     assert_allclose(local.pressure(ground_truth=True), (load / 0.002, load / 0.004, 0), atol=10.0)
     assert local.is_complete.all()
     assert_equal(local.read().force, local_data.force)
+    assert_equal(world.read().force, world_data.force)
     assert_allclose(world.taxel_normals, ((0, 0, -1), (0, 0, -1), (0, 0, -1)), atol=1e-6)
+    # The bulk read orders sensors by entity, so the two-taxel floor sensor precedes the sphere sensors.
     bulk = scene.read_sensors()[gs.sensors.types.SolverContactTaxel]
-    assert_equal(bulk[..., :9].reshape(local_data.force.shape), local_data.force)
-    assert_equal(bulk[..., 9:18].reshape(local_data.couple.shape), local_data.couple)
+    assert_equal(bulk[..., 12:21].reshape(local_data.force.shape), local_data.force)
+    assert_equal(bulk[..., 21:30].reshape(local_data.couple.shape), local_data.couple)
+
+    # Mixed sources close to the floor wrench over both contact sources, per source on each taxel.
+    mixed_data = mixed.read_ground_truth()
+    mixed_force = mixed_data.force.reshape(-1, 2, 3)
+    mixed_couple = mixed_data.couple.reshape(-1, 2, 3)
+    wrench = floor.get_links_contact_wrench()
+    hybrid_wrench = floor.get_links_contact_wrench(source="hybrid")
+    assert (hybrid_wrench.force[:, 0, 2] < -1.0).all()
+    assert_allclose(mixed_force[:, 0], hybrid_wrench.force[:, 0], tol=1e-5)
+    assert_allclose(mixed_force[:, 1], (0, 0, -load), atol=0.01)
+    assert_allclose(mixed_force.sum(dim=1), wrench.force[:, 0], tol=1e-5)
+    probes = torch.tensor(((-0.25, -0.25, 0.0), (0.3, 0.2, 0.0)), dtype=gs.tc_float, device=gs.device)
+    transported = (probes.expand_as(mixed_force).cross(mixed_force, dim=-1) + mixed_couple).sum(dim=1)
+    assert_allclose(transported, wrench.torque[:, 0], tol=1e-5)
+
+    # Moving the sensor frame on the link moves its taxels: the contact now sits under the first taxel center.
+    world.set_pos_offset((0.0, 0.02, 0.0))
+    scene.step()
+    shares = torch.tensor((1.0, (1 - 0.8**2) ** 2, 0.0), dtype=gs.tc_float, device=gs.device)
+    shares /= shares.sum()
+    assert_allclose(world.read_ground_truth().force[..., 2], load * shares, atol=0.01)
+    # A gain set on a default profile enables the hardware response, which scales the link-frame wrench.
+    world.set_probe_gain(2.0)
+    scene.step()
+    assert_allclose(world.read().force, 2.0 * world.read_ground_truth().force, atol=1e-5)
+    assert_allclose(world.read().couple, 2.0 * world.read_ground_truth().couple, atol=1e-6)
 
     saved = local_data.force.clone()
     normals = local.taxel_normals

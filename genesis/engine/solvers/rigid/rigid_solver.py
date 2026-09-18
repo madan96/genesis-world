@@ -282,6 +282,11 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         self._enable_heterogeneous = False  # Set to True when any entity has heterogeneous morphs
         self._passive_models = []
 
+        # Whether mass_mat holds the mass matrix without implicit damping at the current configuration, so that the next
+        # forward dynamics only adds the damping to it. Applying rigid impulses sets it between two substeps of one step,
+        # when nothing can move or re-weigh the bodies before the next forward dynamics, which clears it.
+        self._is_mass_mat_updated: bool = False
+
         # The differentiable solve keeps every body in its iteration trace, so hibernation stays off there (see the
         # use_hibernation option).
         self._use_hibernation = options.use_hibernation and not self._requires_grad
@@ -810,13 +815,12 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         one, so the gate never leaves a scene that needs equilibration without it; its only error is to enable it for a
         scene that does not, at a small runtime cost.
         """
-        children, links_desc = {}, {}
+        # A link and its descendants share one variant count: a child in another entity comes from 'attach', which
+        # refuses heterogeneous entities on either side, so both entities then hold a single variant.
+        children = {}
         for entity in self._entities:
             for link in entity.links:
                 children.setdefault(link.parent_idx, []).append(link)
-                links_desc[link.idx] = [link.desc] + [
-                    variant.links[link.idx - entity.link_start] for variant in entity.desc.variants[1:]
-                ]
 
         # Per entity, the smallest lower bound and the largest upper bound over its entries, per variant.
         entities_lower, entities_upper = [], []
@@ -837,10 +841,11 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             for link in entity.links:
                 if link.is_fixed:
                     continue
-                mass = np.array([desc.mass for desc in links_desc[link.idx]])
-                inertial_pos = np.array([desc.inertial_pos for desc in links_desc[link.idx]])
-                inertial_quat = np.array([desc.inertial_quat for desc in links_desc[link.idx]])
-                inertia = np.array([desc.inertia for desc in links_desc[link.idx]])
+                links_desc = link.variants_desc
+                mass = np.array([desc.mass for desc in links_desc])
+                inertial_pos = np.array([desc.inertial_pos for desc in links_desc])
+                inertial_quat = np.array([desc.inertial_quat for desc in links_desc])
+                inertia = np.array([desc.inertia for desc in links_desc])
                 is_rotor = link in rotor_links
                 for joint in link.joints:
                     if joint.type == gs.JOINT_TYPE.FIXED:
@@ -860,13 +865,9 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                         cur = stack.pop()
                         sub.append(cur)
                         for child in children.get(cur.idx, []):
-                            child_pos_norm = np.linalg.norm([desc.pos for desc in links_desc[child.idx]], axis=-1)
-                            child_com_norm = np.linalg.norm(
-                                [desc.inertial_pos for desc in links_desc[child.idx]], axis=-1
-                            )
-                            # Another entity's variant can vary independently of this entity's variant.
-                            if child.entity is not entity:
-                                child_pos_norm, child_com_norm = child_pos_norm.max(), child_com_norm.max()
+                            child_links_desc = child.variants_desc
+                            child_pos_norm = np.linalg.norm([desc.pos for desc in child_links_desc], axis=-1)
+                            child_com_norm = np.linalg.norm([desc.inertial_pos for desc in child_links_desc], axis=-1)
                             hop = child_pos_norm + 2.0 * sum(np.linalg.norm(j.pos) for j in child.joints)
                             # A prismatic descendant carries the subtree outward by up to its full travel span (which
                             # covers the offset from any zero configuration within limits); an unlimited slide makes the
@@ -877,20 +878,15 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                             dist_origin[child.idx] = dist_origin[cur.idx] + hop
                             dist_com[child.idx] = dist_origin[child.idx] + child_com_norm
                             stack.append(child)
-                    sub_mass_lower = np.zeros(variants_default.size)
-                    sub_mass_upper = np.zeros(variants_default.size)
+                    sub_mass = np.zeros(variants_default.size)
                     rot_desc_upper = np.zeros(variants_default.size)
                     for descendant in sub:
-                        masses = np.array([desc.mass for desc in links_desc[descendant.idx]])
-                        inertia_max = np.linalg.eigvalsh([desc.inertia for desc in links_desc[descendant.idx]])[..., -1]
-                        mass_lower, mass_upper = masses, masses
-                        if descendant.entity is not entity:
-                            mass_lower, mass_upper = masses.min(), masses.max()
-                            inertia_max = inertia_max.max()
-                        sub_mass_lower += mass_lower
-                        sub_mass_upper += mass_upper
+                        descendant_links_desc = descendant.variants_desc
+                        masses = np.array([desc.mass for desc in descendant_links_desc])
+                        inertia_max = np.linalg.eigvalsh([desc.inertia for desc in descendant_links_desc])[..., -1]
+                        sub_mass += masses
                         if descendant is not link:
-                            rot_desc_upper += inertia_max + mass_upper * dist_com[descendant.idx] ** 2
+                            rot_desc_upper += inertia_max + masses * dist_com[descendant.idx] ** 2
                     eigvals = np.linalg.eigvalsh(inertia)
                     # Carrying link's inertia about the anchor: exact along a fixed axis, otherwise between its smallest
                     # and largest principal inertia.
@@ -911,8 +907,8 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                         else:
                             armature = np.full(variants_default.size, armature_d)
                         if joint.type == gs.JOINT_TYPE.PRISMATIC or (joint.type == gs.JOINT_TYPE.FREE and i_d < 3):
-                            lower.append(armature + sub_mass_lower)
-                            upper.append(armature + sub_mass_upper)
+                            lower.append(armature + sub_mass)
+                            upper.append(armature + sub_mass)
                         elif joint.type == gs.JOINT_TYPE.REVOLUTE and is_sole_joint:
                             axis = joint.desc.dofs_motion_ang[i_d]
                             lever = np.cross(axis, offset_com)
@@ -1080,11 +1076,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             links_inertial_pos = np.array([link._variant_inertial[v][1] for v in variant_idx], dtype=gs.np_float)
             links_inertial_quat = np.array([link._variant_inertial[v][2] for v in variant_idx], dtype=gs.np_float)
             links_inertial_i = np.array([link._variant_inertial[v][3] for v in variant_idx], dtype=gs.np_float)
-            links_desc = [link.desc] * n_variants
-            if link.parent_idx != -1:
-                links_desc[1:] = [
-                    variant.links[link.idx - link.entity.link_start] for variant in link.entity.desc.variants[1:]
-                ]
+            links_desc = link.variants_desc
             links_pos = np.array([links_desc[v].pos for v in variant_idx], dtype=gs.np_float)
             links_quat = np.array([links_desc[v].quat for v in variant_idx], dtype=gs.np_float)
 
@@ -1318,6 +1310,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
 
         if self._passive_models:
             self.dyn_state.dofs.qf_passive_model.fill(0.0)
+            self.dyn_state.dofs.damping_passive_model.fill(0.0)
             for model in self._passive_models:
                 model._evaluate(is_apply=True)
 
@@ -1343,8 +1336,10 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             self.rigid_config,
             self._is_forward_pos_updated,
             self._is_forward_vel_updated,
+            self._is_mass_mat_updated,
             self._is_backward,
         )
+        self._is_mass_mat_updated = False
 
         if isinstance(self.sim.coupler, SAPCoupler):
             update_qvel(self.dyn_state, self.rigid_info, self.rigid_config)
@@ -1962,6 +1957,8 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         self._restart()
 
     def process_input(self, in_backward=False):
+        # A step interrupted by an exception may leave the flag set before calls that move or re-weigh the bodies
+        self._is_mass_mat_updated = False
         for entity in self._entities:
             entity.process_input(in_backward=in_backward)
 
@@ -3523,6 +3520,7 @@ def kernel_step_1(
     rigid_config: qd.template(),
     is_forward_pos_updated: qd.template(),
     is_forward_vel_updated: qd.template(),
+    is_mass_mat_updated: qd.template(),
     is_backward: qd.template(),
 ):
     if qd.static(not is_forward_pos_updated):
@@ -3533,7 +3531,9 @@ def kernel_step_1(
     if qd.static(not is_forward_vel_updated):
         func_forward_velocity(dyn_state, dyn_info, rigid_info, rigid_config, is_backward)
 
-    func_forward_dynamics(dyn_state, constraint_state, dyn_info, rigid_info, rigid_config, is_backward)
+    func_forward_dynamics(
+        dyn_state, constraint_state, dyn_info, rigid_info, rigid_config, is_mass_mat_updated, is_backward
+    )
 
 
 @qd.kernel(fastcache=True)

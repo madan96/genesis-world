@@ -19,21 +19,36 @@ class RigidImpulses:
         self.angular.fill(0.0)
 
     def apply(self):
+        """Change the dof velocities by the accumulated impulses through the mass matrix and clear the accumulator.
+
+        The velocity change takes effect at the end of the current substep, before the next substep of any solver.
+        The forward dynamics of the next substep of the same step reuses the mass matrix assembled here (see
+        RigidSolver._is_mass_mat_updated), unless the link poses predate the integration of this substep or the bodies
+        may hibernate.
+        """
         from genesis.engine.solvers.rigid.abd.impulses import kernel_apply_rigid_impulses
 
-        if self.solver.n_dofs:
-            kernel_apply_rigid_impulses(
-                self.solver.dyn_state,
-                self.solver.constraint_solver.constraint_state,
-                self.solver.dyn_info,
-                self.solver.rigid_info,
-                self.solver.rigid_config,
-                self.generalized,
-                self.velocity_delta,
-                self,
-            )
-            self.solver._is_forward_vel_updated = True
-        self.clear()
+        if not self.solver.n_dofs:
+            self.clear()
+            return
+        sim = self.solver.sim
+        is_mass_mat_reused = (
+            self.solver._is_forward_pos_updated
+            and not self.solver.rigid_config.use_hibernation
+            and (sim.cur_substep_global + 1) % sim.substeps > 0
+        )
+        kernel_apply_rigid_impulses(
+            is_mass_mat_reused,
+            self.generalized,
+            self.velocity_delta,
+            self,
+            self.solver.dyn_state,
+            self.solver.constraint_solver.constraint_state,
+            self.solver.dyn_info,
+            self.solver.rigid_info,
+            self.solver.rigid_config,
+        )
+        self.solver._is_mass_mat_updated = is_mass_mat_reused
 
 
 @qd.func

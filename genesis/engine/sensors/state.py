@@ -15,7 +15,7 @@ class SensorManagerState:
 
     Timeline arrays use [B, age, channel], newest first, independently of the live ring cursor. Restoring selected
     environments preserves every other environment's history. Hardware randomization, drift and captured noisy
-    samples are included; future random draws use the caller-controlled torch RNG, whose state is not rewound.
+    samples are included. Restoring rewinds no random number generator (see 'Scene.reset').
     """
 
     ground_truth_intermediate: dict[torch.dtype, torch.Tensor]

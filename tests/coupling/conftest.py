@@ -65,3 +65,38 @@ def skin_chain():
         ET.SubElement(joint, "axis", xyz="0 0 1")
         ET.SubElement(joint, "limit", lower="-1", upper="1", effort="100", velocity="10")
     return ET.tostring(urdf, encoding="unicode")
+
+
+@pytest.fixture
+def skin_limb():
+    urdf = ET.Element("robot", name="limb")
+    for name, mass, inertia, size in (
+        ("shaft", "1", ("0.0002", "0.0075", "0.0075"), "0.3 0.04 0.04"),
+        ("cap", "0.5", ("0.0005", "0.0005", "0.0005"), "0.04 0.04 0.04"),
+    ):
+        link = ET.SubElement(urdf, "link", name=name)
+        inertial = ET.SubElement(link, "inertial")
+        ET.SubElement(inertial, "mass", value=mass)
+        ixx, iyy, izz = inertia
+        ET.SubElement(inertial, "inertia", ixx=ixx, iyy=iyy, izz=izz, ixy="0", ixz="0", iyz="0")
+        collision = ET.SubElement(link, "collision")
+        geometry = ET.SubElement(collision, "geometry")
+        ET.SubElement(geometry, "box", size=size)
+    joint = ET.SubElement(urdf, "joint", name="hinge", type="revolute")
+    ET.SubElement(joint, "parent", link="shaft")
+    ET.SubElement(joint, "child", link="cap")
+    ET.SubElement(joint, "origin", xyz="0.2 0 0")
+    ET.SubElement(joint, "axis", xyz="0 0 1")
+    ET.SubElement(joint, "limit", lower="-1", upper="1", effort="100", velocity="10")
+    return ET.tostring(urdf, encoding="unicode")
+
+
+@pytest.fixture
+def damped_hinge():
+    mjcf = ET.Element("mujoco")
+    worldbody = ET.SubElement(mjcf, "worldbody")
+    body = ET.SubElement(worldbody, "body", name="rotor", pos="1.5 0 0.5")
+    ET.SubElement(body, "joint", name="spin", type="hinge", axis="0 0 1", damping="6")
+    ET.SubElement(body, "inertial", pos="0 0 0", mass="1", diaginertia="0.01 0.01 0.02")
+    ET.SubElement(body, "geom", type="sphere", size="0.05")
+    return ET.tostring(mjcf, encoding="unicode")

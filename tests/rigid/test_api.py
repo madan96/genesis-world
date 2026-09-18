@@ -396,8 +396,9 @@ def test_data_accessor(n_envs, batched, tol):
 
 
 @pytest.mark.required
+@pytest.mark.parametrize("add_particles", [False, True])
 @pytest.mark.parametrize("enable_mujoco_compatibility", [True, False])
-def test_getter_vs_state_post_step_consistency(enable_mujoco_compatibility):
+def test_getter_vs_state_post_step_consistency(enable_mujoco_compatibility, add_particles):
     DT = 0.01
     GRAVITY = 10.0
 
@@ -409,6 +410,10 @@ def test_getter_vs_state_post_step_consistency(enable_mujoco_compatibility):
         rigid_options=gs.options.RigidOptions(
             enable_mujoco_compatibility=enable_mujoco_compatibility,
         ),
+        mpm_options=gs.options.MPMOptions(
+            lower_bound=(1.0, -0.25, -0.25),
+            upper_bound=(1.5, 0.25, 0.25),
+        ),
     )
     box = scene.add_entity(
         gs.morphs.Box(
@@ -417,6 +422,16 @@ def test_getter_vs_state_post_step_consistency(enable_mujoco_compatibility):
         )
     )
     (box_link,) = box.links
+    # Without particles the MPM solver stays inactive and the scene steps the rigid solver alone. Particles out of reach
+    # of the box make the coupling apply zero impulses, which must leave the same post-step state.
+    if add_particles:
+        scene.add_entity(
+            morph=gs.morphs.Box(
+                size=(0.1, 0.1, 0.1),
+                pos=(1.25, 0.0, 0.0),
+            ),
+            material=gs.materials.MPM.Elastic(),
+        )
     scene.build()
 
     scene.step()

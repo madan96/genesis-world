@@ -131,7 +131,9 @@ class LegacyCoupler(RBC):
 
     def on_step_begin(self):
         if self.contact_telemetry is not None:
-            self.contact_telemetry.reset(self.sim.scene._envs_idx)
+            # Contacts are read between scene steps only, so the interval they accumulate over is the whole step,
+            # including substeps without contact.
+            self.contact_telemetry.reset(interval=self.sim.dt)
         if self.mpm_solver.is_active:
             self.mpm_solver.active_cell_count.fill(0)
 
@@ -139,7 +141,7 @@ class LegacyCoupler(RBC):
         if envs_idx is not None:
             envs_idx = self.sim.scene._sanitize_envs_idx(envs_idx)
         if self.contact_telemetry is not None:
-            self.contact_telemetry.reset(self.sim.scene._envs_idx if envs_idx is None else envs_idx)
+            self.contact_telemetry.reset(envs_idx)
         if self._rigid_mpm and self.mpm_solver.enable_CPIC:
             if envs_idx is None:
                 self.mpm_rigid_normal.fill(0)
@@ -1104,9 +1106,8 @@ class LegacyCoupler(RBC):
                 sdf_info=self.rigid_solver.collider._sdf._sdf_info,
                 collider_static_config=self.rigid_solver.collider.collider_config,
             )
-
             if self.contact_telemetry is not None:
-                self.contact_telemetry.advance_interval(self.mpm_solver.substep_dt)
+                self.contact_telemetry.reduce_partials()
 
         # SPH <-> Rigid
         if self._rigid_sph:

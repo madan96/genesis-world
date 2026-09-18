@@ -13,7 +13,7 @@ import genesis.utils.geom as gu
 from genesis.engine.contact_contributions import SOURCE_HYBRID, SOURCE_RIGID, ContactContributions
 from genesis.options.sensors import SolverContactTaxel as SolverContactTaxelOptions
 from genesis.options.sensors.tactile_profile import TactileHardwareProfile
-from genesis.utils.misc import qd_to_torch, tensor_to_array
+from genesis.utils.misc import qd_to_torch
 
 from .base_sensor import (
     RigidSensorMetadataMixin,
@@ -31,7 +31,7 @@ def _kernel_splat_contact_wrenches(
     position: qd.types.ndarray(),
     force: qd.types.ndarray(),
     sign: qd.types.ndarray(),
-    probe_world: qd.types.ndarray(),
+    taxels_world: qd.types.ndarray(),
     probe_radius: qd.types.ndarray(),
     result: qd.types.ndarray(),
 ):
@@ -45,28 +45,35 @@ def _kernel_splat_contact_wrenches(
             for i_p in range(probe_radius.shape[0]):
                 radius = probe_radius[i_p]
                 if radius > 0.0:
-                    probe_pos = qd.Vector([probe_world[i_b, i_p, i] for i in qd.static(range(3))])
-                    distance_sq = (probe_pos - contact_pos).norm_sqr()
-                    weight_sum += qd.max(0.0, 1.0 - distance_sq / (radius * radius)) ** 2
+                    offset = contact_pos - qd.Vector([taxels_world[i_b, 0, i_p, i] for i in qd.static(range(3))])
+                    probe_normal = qd.Vector([taxels_world[i_b, 1, i_p, i] for i in qd.static(range(3))])
+                    distance_sq = offset.norm_sqr()
+                    # The support is a disc on the taxel plane, so a hybrid grid node below the surface keeps the
+                    # lateral weights of the surface point above it.
+                    plane_distance_sq = distance_sq - offset.dot(probe_normal) ** 2
+                    weight_sum += qd.max(0.0, 1.0 - plane_distance_sq / (radius * radius)) ** 2
                     if nearest < 0 or distance_sq < nearest_distance:
                         nearest = i_p
                         nearest_distance = distance_sq
             for i_p in range(probe_radius.shape[0]):
                 radius = probe_radius[i_p]
                 if radius > 0.0:
-                    probe_pos = qd.Vector([probe_world[i_b, i_p, i] for i in qd.static(range(3))])
+                    offset = contact_pos - qd.Vector([taxels_world[i_b, 0, i_p, i] for i in qd.static(range(3))])
                     weight = gs.qd_float(0.0)
                     if weight_sum > 0.0:
-                        distance_sq = (probe_pos - contact_pos).norm_sqr()
-                        weight = qd.max(0.0, 1.0 - distance_sq / (radius * radius)) ** 2 / weight_sum
+                        probe_normal = qd.Vector([taxels_world[i_b, 1, i_p, i] for i in qd.static(range(3))])
+                        plane_distance_sq = offset.norm_sqr() - offset.dot(probe_normal) ** 2
+                        weight = qd.max(0.0, 1.0 - plane_distance_sq / (radius * radius)) ** 2 / weight_sum
                     elif i_p == nearest:
                         weight = 1.0
-                    force_share = weight * contact_force
-                    couple_share = (contact_pos - probe_pos).cross(force_share)
-                    i_s = i_c % result.shape[1]
-                    for i in qd.static(range(3)):
-                        qd.atomic_add(result[i_b, i_s, 0, i_p, i], force_share[i])
-                        qd.atomic_add(result[i_b, i_s, 1, i_p, i], couple_share[i])
+                    # A contact lies inside few supports, so most taxels take a zero share and skip the atomics.
+                    if weight > 0.0:
+                        force_share = weight * contact_force
+                        couple_share = offset.cross(force_share)
+                        i_s = i_c % result.shape[1]
+                        for i in qd.static(range(3)):
+                            qd.atomic_add(result[i_b, i_s, 0, i_p, i], force_share[i])
+                            qd.atomic_add(result[i_b, i_s, 1, i_p, i], couple_share[i])
 
 
 class SolverContactTaxelReturnType(NamedTuple):
@@ -122,22 +129,29 @@ class TactileReadoutState:
     positions: torch.Tensor
     normals: torch.Tensor
     radii: torch.Tensor
+    is_inactive: torch.Tensor
+    has_inactive_taxels: bool
     areas: torch.Tensor
     gains: torch.Tensor
     nominal_gains: torch.Tensor
     offset: torch.Tensor
-    validity: torch.Tensor
+    is_invalid: torch.Tensor
+    has_invalid_taxels: bool
     dead: torch.Tensor
     dead_value: torch.Tensor
     temperature: torch.Tensor
     saturation_scale: torch.Tensor
     hysteresis_scale: torch.Tensor
     crosstalk: torch.Tensor | None
+    # Whether gain, offset, temperature, transfer curves or couple saturation can change the measured wrench. Set at
+    # build and latched True by the gain setter or a restored state, following the `has_any_*` flags of SimpleSensor.
+    has_hardware_response: bool
     raw: torch.Tensor
     partial_wrenches: torch.Tensor
-    probe_world: torch.Tensor
-    positions_link: torch.Tensor
-    normals_link: torch.Tensor
+    # Taxel centers ([:, 0]) and outward normals ([:, 1]) in the link frame, which change only with the sensor offsets.
+    taxels_link: torch.Tensor
+    # The same taxel centers and normals in the world frame, which follow the link pose every step.
+    taxels_world: torch.Tensor
     link_quat: torch.Tensor
     is_complete: torch.Tensor
     filter_state: torch.Tensor
@@ -148,13 +162,38 @@ class TactileReadoutState:
     sample_index: torch.Tensor
     dt: float
 
-    def update_geometry(self, link_pos, link_quat, offset_pos, offset_quat) -> None:
-        self.link_quat.copy_(link_quat)
-        self.positions_link.copy_(
-            gu.transform_by_quat(self.positions[None], offset_quat[:, None]) + offset_pos[:, None]
+    @property
+    def positions_link(self) -> torch.Tensor:
+        return self.taxels_link[:, 0]
+
+    @property
+    def normals_link(self) -> torch.Tensor:
+        return self.taxels_link[:, 1]
+
+    def has_link_frame_response(self, has_any_electronics: bool) -> bool:
+        """Whether the measured branch applies an effect defined on the link axes of the taxels.
+
+        ``has_any_electronics`` tells whether the class applies drift, noise, bias or quantization to its channels.
+        """
+        return (
+            self.has_hardware_response
+            or self.crosstalk is not None
+            or self.options.hysteresis_strength > 0.0
+            or self.profile.filter_tau > 0.0
+            or self.options.dead_taxel_probability > 0.0
+            or has_any_electronics
         )
-        self.normals_link.copy_(gu.transform_by_quat(self.normals[None], offset_quat[:, None]))
-        self.probe_world.copy_(gu.transform_by_quat(self.positions_link, link_quat[:, None]) + link_pos[:, None])
+
+    def update_offsets(self, offset_pos, offset_quat) -> None:
+        self.taxels_link.copy_(
+            gu.transform_by_quat(torch.stack((self.positions, self.normals))[None], offset_quat[:, None, None])
+        )
+        self.taxels_link[:, 0] += offset_pos[:, None]
+
+    def update_pose(self, link_pos, link_quat) -> None:
+        self.link_quat.copy_(link_quat)
+        self.taxels_world.copy_(gu.transform_by_quat(self.taxels_link, link_quat[:, None, None]))
+        self.taxels_world[:, 0] += link_pos[:, None]
 
     def reset(self, envs_idx) -> None:
         for values in (self.filter_state, self.hysteresis_state, self.previous_input, self.held_sample, self.tick):
@@ -176,6 +215,10 @@ class TactileReadoutState:
 @dataclass
 class SolverContactTaxelMetadata(RigidSensorMetadataMixin, SimpleSensorMetadata):
     readouts: list[TactileReadoutState] = field(default_factory=list)
+
+    @property
+    def has_any_electronics(self) -> bool:
+        return self.has_any_random_walk or self.has_any_noise or self.has_any_bias or self.has_any_resolution
 
 
 def _entity_family(scene, entity_idx: int) -> set[int]:
@@ -231,7 +274,9 @@ class SolverContactTaxelSensor(
     @classmethod
     def state_restored(cls, shared_metadata) -> None:
         super().state_restored(shared_metadata)
-        cls._update_geometry(shared_metadata)
+        for readout in shared_metadata.readouts:
+            readout.has_hardware_response |= bool(((readout.gains - 1.0).abs() > gs.EPS).any())
+        cls._update_geometry(shared_metadata, update_offsets=True)
 
     @classmethod
     def _get_intermediate_dtype(cls):
@@ -277,9 +322,20 @@ class SolverContactTaxelSensor(
             crosstalk /= crosstalk.sum(dim=0, keepdim=True).clamp_min(torch.finfo(gs.tc_float).tiny)
             crosstalk *= options.crosstalk_strength
             crosstalk += (1.0 - options.crosstalk_strength) * torch.diag(active.to(gs.tc_float))
-        validity = torch.ones(P, dtype=torch.bool, device=gs.device)
+        is_invalid = torch.zeros((P, 1), dtype=torch.bool, device=gs.device)
         if profile.validity is not None:
-            validity = torch.tensor(profile.validity, dtype=torch.bool, device=gs.device)
+            is_invalid = ~torch.tensor(profile.validity, dtype=torch.bool, device=gs.device)[:, None]
+        offset = per_taxel(profile.offset)
+        has_hardware_response = (
+            not profile.normal_curve.is_identity
+            or not profile.shear_curve.is_identity
+            or profile.couple_saturation is not None
+            or abs(profile.gain_temp_coeff) > gs.EPS
+            or abs(profile.offset_temp_coeff) > gs.EPS
+            or options.probe_gain_resample_range is not None
+            or bool((offset.abs() > gs.EPS).any())
+            or bool(((gains - 1.0).abs() > gs.EPS).any())
+        )
         readout = TactileReadoutState(
             options=options,
             profile=profile,
@@ -294,23 +350,26 @@ class SolverContactTaxelSensor(
             positions=positions,
             normals=normals,
             radii=radii,
+            is_inactive=(radii <= 0.0)[:, None],
+            has_inactive_taxels=bool((radii <= 0.0).any()),
             areas=areas,
             gains=gains.expand(B, P).clone(),
             nominal_gains=gains,
-            offset=per_taxel(profile.offset),
-            validity=validity,
+            offset=offset,
+            is_invalid=is_invalid,
+            has_invalid_taxels=bool(is_invalid.any()),
             dead=torch.zeros((B, P), dtype=torch.bool, device=gs.device),
             dead_value=torch.zeros((B, P), dtype=gs.tc_float, device=gs.device),
             temperature=torch.full((B, 1), profile.temperature_c, dtype=gs.tc_float, device=gs.device),
             saturation_scale=torch.ones((B, 1), dtype=gs.tc_float, device=gs.device),
             hysteresis_scale=torch.ones((B, 1, 1, 1), dtype=gs.tc_float, device=gs.device),
             crosstalk=crosstalk,
+            has_hardware_response=has_hardware_response,
             raw=torch.zeros((B, 2, P, 3), dtype=gs.tc_float, device=gs.device),
             # Partial sums limit float32 roundoff and atomic contention when many contacts share one taxel.
             partial_wrenches=torch.zeros((B, 32, 2, P, 3), dtype=gs.tc_float, device=gs.device),
-            probe_world=torch.zeros((B, P, 3), dtype=gs.tc_float, device=gs.device),
-            positions_link=torch.zeros((B, P, 3), dtype=gs.tc_float, device=gs.device),
-            normals_link=torch.zeros((B, P, 3), dtype=gs.tc_float, device=gs.device),
+            taxels_link=torch.zeros((B, 2, P, 3), dtype=gs.tc_float, device=gs.device),
+            taxels_world=torch.zeros((B, 2, P, 3), dtype=gs.tc_float, device=gs.device),
             link_quat=torch.zeros((B, 4), dtype=gs.tc_float, device=gs.device),
             is_complete=torch.ones(B, dtype=torch.bool, device=gs.device),
             filter_state=torch.zeros((B, 2, P, 3), dtype=gs.tc_float, device=gs.device),
@@ -323,20 +382,22 @@ class SolverContactTaxelSensor(
         )
         self._shared_metadata.readouts.append(readout)
         readout.reset(torch.arange(B, device=gs.device))
-        self._update_geometry(self._shared_metadata)
+        self._update_geometry(self._shared_metadata, update_offsets=True)
 
     @classmethod
-    def _update_geometry(cls, shared_metadata):
+    def _update_geometry(cls, shared_metadata, *, update_offsets: bool = False):
+        """Place the taxels at the current link poses, first recomputing their link-frame layout if requested.
+
+        The link-frame layout depends only on the sensor offsets, so it is recomputed at build, after an offset setter
+        and after a state restore.
+        """
         solver = shared_metadata.solver
         positions = qd_to_torch(solver.dyn_state.links.pos, transpose=True)
         quaternions = qd_to_torch(solver.dyn_state.links.quat, transpose=True)
         for i_s, readout in enumerate(shared_metadata.readouts):
-            readout.update_geometry(
-                positions[:, readout.link_idx],
-                quaternions[:, readout.link_idx],
-                shared_metadata.offsets_pos[:, i_s],
-                shared_metadata.offsets_quat[:, i_s],
-            )
+            if update_offsets:
+                readout.update_offsets(shared_metadata.offsets_pos[:, i_s], shared_metadata.offsets_quat[:, i_s])
+            readout.update_pose(positions[:, readout.link_idx], quaternions[:, readout.link_idx])
 
     @classmethod
     def reset(cls, shared_metadata, shared_ground_truth_cache, envs_idx):
@@ -344,6 +405,16 @@ class SolverContactTaxelSensor(
         for readout in shared_metadata.readouts:
             readout.reset(envs_idx)
         cls._update_geometry(shared_metadata)
+
+    @gs.assert_built
+    def set_pos_offset(self, pos_offset, envs_idx=None):
+        super().set_pos_offset(pos_offset, envs_idx)
+        self._update_geometry(self._shared_metadata, update_offsets=True)
+
+    @gs.assert_built
+    def set_quat_offset(self, quat_offset, envs_idx=None):
+        super().set_quat_offset(quat_offset, envs_idx)
+        self._update_geometry(self._shared_metadata, update_offsets=True)
 
     @classmethod
     def _update_raw_data(cls, shared_context, shared_metadata, raw_data_T):
@@ -382,12 +453,15 @@ class SolverContactTaxelSensor(
                     contacts.position,
                     contacts.force,
                     sign,
-                    readout.probe_world,
+                    readout.taxels_world,
                     readout.radii,
                     readout.partial_wrenches,
                 )
             torch.sum(readout.partial_wrenches, dim=1, out=readout.raw)
-            readout.raw.copy_(gu.inv_transform_by_quat(readout.raw, readout.link_quat[:, None, None, :]))
+            # The raw wrench stays in the output frame. The measured branch rotates into the link frame only when one of
+            # its effects needs it (see `has_link_frame_response`).
+            if options.frame == "link":
+                readout.raw.copy_(gu.inv_transform_by_quat(readout.raw, readout.link_quat[:, None, None, :]))
             raw_data_T[readout.cache_slice] = readout.raw.reshape(B, -1).T
 
     @classmethod
@@ -395,11 +469,13 @@ class SolverContactTaxelSensor(
         if not is_measured:
             return
         B = data.shape[0]
+        has_any_electronics = shared_metadata.has_any_electronics
         for readout in shared_metadata.readouts:
             values = data[:, readout.cache_slice].view(B, 2, -1, 3)
+            if readout.options.frame == "world" and readout.has_link_frame_response(has_any_electronics):
+                values.copy_(gu.inv_transform_by_quat(values, readout.link_quat[:, None, None, :]))
+            # An incomplete step holds the filter and hysteresis states. `_post_process` marks its samples NaN.
             complete = readout.is_complete[:, None, None, None]
-            # Invalid rows remain private finite scratch values; public samples are marked NaN after processing.
-            values.mul_(complete)
             if readout.crosstalk is not None:
                 forces, couples = values[:, 0], values[:, 1]
                 origin_moments = couples + readout.positions_link.cross(forces, dim=-1)
@@ -409,21 +485,22 @@ class SolverContactTaxelSensor(
                 values[:, 1] = moments - readout.positions_link.cross(forces, dim=-1)
             if readout.options.hysteresis_strength > 0.0:
                 alpha = math.exp(-readout.dt / readout.options.hysteresis_tau)
-                readout.hysteresis_state.mul_(alpha).add_(values).sub_(readout.previous_input)
-                readout.previous_input.copy_(values)
+                hysteresis = readout.hysteresis_state * alpha + values - readout.previous_input
+                readout.hysteresis_state.copy_(torch.where(complete, hysteresis, readout.hysteresis_state))
+                readout.previous_input.copy_(torch.where(complete, values, readout.previous_input))
                 values.add_(readout.options.hysteresis_strength * readout.hysteresis_scale * readout.hysteresis_state)
-                readout.hysteresis_state.mul_(complete)
-                readout.previous_input.mul_(complete)
             if readout.profile.filter_tau > 0.0:
                 alpha = -math.expm1(-readout.dt / readout.profile.filter_tau)
-                readout.filter_state.lerp_(values, alpha)
-                readout.filter_state.mul_(complete)
+                filtered = readout.filter_state.lerp(values, alpha)
+                readout.filter_state.copy_(torch.where(complete, filtered, readout.filter_state))
                 values.copy_(readout.filter_state)
 
     @classmethod
     def _apply_hardware_imperfections(cls, shared_metadata, data):
         B = data.shape[0]
         for readout in shared_metadata.readouts:
+            if not readout.has_hardware_response:
+                continue
             values = data[:, readout.cache_slice].view(B, 2, -1, 3)
             profile = readout.profile
             delta_temperature = readout.temperature - profile.temperature_c
@@ -449,15 +526,25 @@ class SolverContactTaxelSensor(
 
     @classmethod
     def _post_process(cls, shared_metadata, tensor, timeline, *, is_measured):
+        # The manager keeps `tensor` as the pre-projection intermediate cache captured by scene snapshots.
         result = tensor.clone()
         B = result.shape[0]
+        has_any_electronics = shared_metadata.has_any_electronics
         for readout in shared_metadata.readouts:
             values = result[:, readout.cache_slice].view(B, 2, -1, 3)
             if is_measured:
-                values.masked_fill_(~readout.validity[None, None, :, None], 0.0)
-                values.copy_(torch.where(readout.dead[:, None, :, None], readout.dead_value[:, None, :, None], values))
-            values.masked_fill_(~(readout.radii > 0.0)[None, None, :, None], 0.0)
-            if readout.options.frame == "world":
+                if readout.has_invalid_taxels:
+                    values.masked_fill_(readout.is_invalid, 0.0)
+                if readout.options.dead_taxel_probability > 0.0:
+                    dead_value = readout.dead_value[:, None, :, None]
+                    values.copy_(torch.where(readout.dead[:, None, :, None], dead_value, values))
+            if readout.has_inactive_taxels:
+                values.masked_fill_(readout.is_inactive, 0.0)
+            if (
+                is_measured
+                and readout.options.frame == "world"
+                and readout.has_link_frame_response(has_any_electronics)
+            ):
                 values.copy_(gu.transform_by_quat(values, readout.link_quat[:, None, None, :]))
             values.masked_fill_(~readout.is_complete[:, None, None, None], float("nan"))
             if is_measured and readout.profile.sample_rate is not None:
@@ -471,46 +558,6 @@ class SolverContactTaxelSensor(
         return result
 
     @gs.assert_built
-    def set_resolution(self, resolution, envs_idx=None) -> None:
-        """Set finite nonnegative quantization steps for selected environments/channels."""
-        values = torch.as_tensor(resolution, dtype=gs.tc_float, device=gs.device)
-        if not torch.isfinite(values).all() or (values < 0.0).any():
-            gs.raise_exception("SolverContactTaxel resolution must be finite and nonnegative.")
-        super().set_resolution(values, envs_idx)
-
-    @gs.assert_built
-    def set_noise(self, noise, envs_idx=None) -> None:
-        """Set finite nonnegative Gaussian noise scales for selected environments/channels."""
-        values = torch.as_tensor(noise, dtype=gs.tc_float, device=gs.device)
-        if not torch.isfinite(values).all() or (values < 0.0).any():
-            gs.raise_exception("SolverContactTaxel noise must be finite and nonnegative.")
-        super().set_noise(values, envs_idx)
-
-    @gs.assert_built
-    def set_random_walk(self, random_walk, envs_idx=None) -> None:
-        """Set finite nonnegative drift increment scales per step for selected environments/channels."""
-        values = torch.as_tensor(random_walk, dtype=gs.tc_float, device=gs.device)
-        if not torch.isfinite(values).all() or (values < 0.0).any():
-            gs.raise_exception("SolverContactTaxel random_walk must be finite and nonnegative.")
-        super().set_random_walk(values, envs_idx)
-
-    @gs.assert_built
-    def set_bias(self, bias, envs_idx=None) -> None:
-        """Set finite signed bias for selected environments/channels."""
-        values = torch.as_tensor(bias, dtype=gs.tc_float, device=gs.device)
-        if not torch.isfinite(values).all():
-            gs.raise_exception("SolverContactTaxel bias must be finite.")
-        super().set_bias(values, envs_idx)
-
-    @gs.assert_built
-    def set_jitter(self, jitter, envs_idx=None) -> None:
-        """Set finite additive delay jitter in seconds, bounded by the step and configured delay."""
-        values = tensor_to_array(jitter, dtype=gs.np_float)
-        if not np.isfinite(values).all():
-            gs.raise_exception("SolverContactTaxel jitter must be finite.")
-        super().set_jitter(values, envs_idx)
-
-    @gs.assert_built
     def set_probe_gain(self, value, envs_idx=None) -> None:
         """Set positive nominal gain for selected environments/taxels; reset resampling uses the configured profile."""
         readout = self._shared_metadata.readouts[self._idx]
@@ -519,6 +566,7 @@ class SolverContactTaxelSensor(
         if not torch.isfinite(values).all() or not (values > 0.0).all():
             gs.raise_exception("SolverContactTaxel gain must be finite and positive.")
         readout.gains[indices] = values.broadcast_to((len(indices), self._n_taxels))
+        readout.has_hardware_response |= bool(((values - 1.0).abs() > gs.EPS).any())
 
     @gs.assert_built
     def set_saturation_scale(self, value, envs_idx=None) -> None:
@@ -556,10 +604,8 @@ class SolverContactTaxelSensor(
     def taxel_normals(self) -> torch.Tensor:
         """Owned outward normals in the configured output frame, shape ([B,] *probe_layout, 3)."""
         readout = self._shared_metadata.readouts[self._idx]
-        normals = readout.normals_link
-        if readout.options.frame == "world":
-            normals = gu.transform_by_quat(normals, readout.link_quat[:, None, :])
-        normals = normals.reshape(-1, *self._layout, 3).clone()
+        taxels = readout.taxels_world if readout.options.frame == "world" else readout.taxels_link
+        normals = taxels[:, 1].reshape(-1, *self._layout, 3).clone()
         return normals[0] if self._manager._sim.n_envs == 0 else normals
 
     @property
@@ -608,7 +654,7 @@ class SolverContactTaxelSensor(
         readout = self._shared_metadata.readouts[self._idx]
         self._debug_objects.append(
             context.draw_debug_spheres(
-                poss=readout.probe_world.reshape(-1, 3),
+                poss=readout.taxels_world[:, 0].reshape(-1, 3),
                 radius=self._options.debug_probe_center_radius,
                 color=(*self._options.debug_probe_color, 1.0),
             )

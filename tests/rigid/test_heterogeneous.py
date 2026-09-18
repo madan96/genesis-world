@@ -407,6 +407,22 @@ def test_invalid_variant_specification_raises(articulated_variants, inconsistent
                 morph=(gs.morphs.MJCF(file=articulated_variants[0]), gs.morphs.MJCF(file=model)),
             )
 
+    # A root without a free joint, placed differently by a variant
+    with pytest.raises(gs.GenesisException, match="root pose"):
+        scene.add_entity(
+            morph=(
+                gs.morphs.MJCF(file=articulated_variants[0]),
+                gs.morphs.MJCF(file=articulated_variants[1], pos=(0.0, 1.0, 0.0)),
+            ),
+        )
+    with pytest.raises(gs.GenesisException, match="root pose"):
+        scene.add_entity(
+            morph=(
+                gs.morphs.Box(size=(1.0, 1.0, 1.0), fixed=True),
+                gs.morphs.Box(size=(1.0, 1.0, 1.0), euler=(0.0, 0.0, 90.0), fixed=True),
+            ),
+        )
+
     morphs_heterogeneous = (
         gs.morphs.Box(size=(1.0, 1.0, 1.0)),
         gs.morphs.Box(size=(1.0, 1.0, 1.0)),

@@ -135,8 +135,23 @@ def load_skinning(skinning, surface: trimesh.Trimesh, link_name_to_idx: dict[str
     return vert_link_idx, vert_weights
 
 
+def region_adjacency(vertex_region: np.ndarray, faces: np.ndarray, n_regions: int) -> np.ndarray:
+    """Symmetric boolean matrix marking the pairs of distinct semantic regions whose labels share a surface triangle."""
+    corner_regions = vertex_region[faces]
+    is_adjacent = np.zeros((n_regions, n_regions), dtype=bool)
+    for i_corner in range(3):
+        for j_corner in range(3):
+            is_adjacent[corner_regions[:, i_corner], corner_regions[:, j_corner]] = True
+    np.fill_diagonal(is_adjacent, False)
+    return is_adjacent
+
+
 def load_regions(regions, surface: trimesh.Trimesh):
-    """Load semantic region IDs per surface vertex."""
+    """Load semantic region IDs per surface vertex.
+
+    Each region may border at most 31 other regions on the surface. The multi-region MPM grid marks the seams of a
+    region with one bit per adjacent region of a 32-bit signed integer (see GridRegions in mpm_grid.py).
+    """
     payload = _load_mapping(regions, "regions")
     if not payload:
         return [], None
@@ -156,6 +171,12 @@ def load_regions(regions, surface: trimesh.Trimesh):
         )
     if vertex_region.min() < 0 or vertex_region.max() >= len(region_names):
         gs.raise_exception("Hybrid 'vertex_region' contains indices outside region_names.")
+    n_adjacent = region_adjacency(vertex_region, surface.faces, len(region_names)).sum(axis=1)
+    if n_adjacent.max() > 31:
+        gs.raise_exception(
+            f"Hybrid region '{region_names[n_adjacent.argmax()]}' borders {n_adjacent.max()} regions. At most 31 "
+            "adjacent regions are supported."
+        )
     return region_names, vertex_region
 
 

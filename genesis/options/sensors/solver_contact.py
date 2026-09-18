@@ -30,9 +30,12 @@ class SolverContactTaxel(
     """Distribute solved contact forces and moments over a rigid link's taxels.
 
     Each contribution uses normalized compact weights ``(1 - (distance / radius)^2)^2`` inside the support
-    radius. A contact outside every active support goes to the nearest active taxel. Zero-radius entries are
-    inactive padding. Force and its moment about the taxel center are transported together, preserving the
-    selected contact wrench. ``support_area`` is in m^2 and defaults to pi * radius^2 for pressure reductions.
+    radius, with the distance measured in the taxel plane: the support is a disc around the taxel center, extended
+    along the taxel normal, so a hybrid contact recorded below the surface weighs like the surface point above it.
+    A contact outside every active support goes to the nearest active taxel, including contacts on other faces of
+    the link. Zero-radius entries are inactive padding. Force and its moment about the taxel center are transported
+    together, preserving the selected contact wrench. ``support_area`` is in m^2 and defaults to pi * radius^2 for
+    pressure reductions.
 
     Positions/normals use the sensor frame given by the link's ``pos_offset`` and ``euler_offset``. Force/couple
     output uses ``frame``; profile response and stateful filters always operate in the link frame. Rigid input
@@ -41,14 +44,20 @@ class SolverContactTaxel(
 
     ``filter_entities``, ``filter_links``, and ``filter_regions`` include only matching counterparts (scene entity,
     global rigid link, and participant-local semantic region indices). None includes all. A hybrid composite entity includes
-    its rigid and soft children. Contacts within the sensor's own entity are excluded. Region filters select
+    its rigid and soft children. Contacts within the sensor's own entity are excluded, whereas link contact wrenches
+    (``get_links_contact_wrench``) count a contact between two links of one entity on both links: the taxel sum
+    closes to the wrench of its link only when that link has no contact with its own entity. Region filters select
     hybrid contributions only. An overflow makes ground truth NaN and invalidates measured samples captured at
-    that step. No incomplete force sum is exposed as a valid measurement.
+    that step. No incomplete force sum is exposed as a valid measurement. Filter and hysteresis states hold through
+    such a step, so a steady load reads steadily again at the next complete step.
 
     ``hardware_profile`` supplies measured-only electronics. Explicit options override matching profile fields.
     The measured response applies crosstalk, Maxwell hysteresis, low-pass filtering, gain and temperature response,
     force transfer curves and normal offset, then drift, noise, bias, and quantization. Taxel faults and the output
     frame are applied before sample-and-hold and delay. Ground truth contains the transported contact wrench.
+    Maxwell hysteresis is viscoelastic: a load ramp at rate ``r`` separates loading and unloading readings by about
+    ``2 * hysteresis_strength * hysteresis_tau * r``, so the loop closes under quasi-static loading. It does not
+    reproduce the rate-independent loop of force-sensing resistors.
     Electronics parameters must be finite; noise, random walk, and resolution must also be nonnegative.
     ``probe_gain_resample_range`` multiplies nominal gains independently per taxel/environment on reset.
     Crosstalk shares signal between arbitrary taxel positions with a column-normalized Gaussian matrix; total

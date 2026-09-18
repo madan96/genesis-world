@@ -5,6 +5,7 @@ import trimesh
 
 import genesis as gs
 from genesis.utils import geom
+from genesis.utils.misc import tensor_to_array
 
 from ..utils.assertions import assert_allclose, assert_equal
 
@@ -84,7 +85,7 @@ def test_generated_skin_nearest_link_binding(n_envs, skin_collision_union, show_
 
 @pytest.mark.required
 @pytest.mark.parametrize("n_envs", [0, 2])
-def test_surface_reference_transforms_and_owned_diagnostics(n_envs, skin_articulation, show_viewer, tol):
+def test_surface_reference_transforms_and_owned_diagnostics(n_envs, skin_articulation, skin_limb, show_viewer, tol):
     TIMECONST = 0.02
     surface = trimesh.creation.box(extents=(0.08, 0.12, 0.16))
     surface.apply_translation((0.01, 0.02, -0.01))
@@ -135,7 +136,40 @@ def test_surface_reference_transforms_and_owned_diagnostics(n_envs, skin_articul
             ),
         ),
     )
+    limb = scene.add_entity(
+        morph=gs.morphs.URDF(
+            pos=(0.1, 0.35, -0.1),
+            file=skin_limb,
+        ),
+        material=gs.materials.Hybrid(
+            material_rigid=gs.materials.Rigid(),
+            material_soft=gs.materials.MPM.Elastic(
+                E=1000.0,
+            ),
+            skin=gs.options.HybridSkinOptions(
+                surface=trimesh.creation.box(extents=(0.3, 0.06, 0.06)),
+                skinning={
+                    "link_names": ["shaft"],
+                    "indices": np.zeros((8, 1), dtype=gs.np_int),
+                    "weights": np.ones((8, 1)),
+                },
+            ),
+            binding=gs.options.HybridBindingOptions(),
+            mass=gs.options.HybridMassOptions(
+                mode="split_total",
+                total_mass=1.5,
+                soft_mass_fraction=0.2,
+            ),
+        ),
+    )
     scene.build(n_envs=n_envs)
+    # The skin covers the shaft only: its particles take their mass from the shaft and the cap keeps its authored mass.
+    limb_mass = limb.get_mass_breakdown()
+    assert_allclose(limb_mass.soft_mass_by_weighted_link, (0.3, 0.0), atol=1e-6)
+    assert_allclose(limb_mass.per_rigid_link, (0.7, 0.5), tol=1e-6)
+    limb_moments = torch.linalg.eigvalsh(limb.part_rigid.get_links_inertia())
+    assert_allclose(limb_moments, ((0.00014, 0.00525, 0.00525), (0.0005, 0.0005, 0.0005)), atol=1e-9)
+    limb_points = limb.part_soft.get_particles_pos().clone()
     initial = entity.part_soft.get_particles_pos().clone()
     points = initial[0] if n_envs else initial
     # R_y(pi/2) R_z(pi/2) maps mesh axes to world +y, +z, +x.
@@ -201,6 +235,67 @@ def test_surface_reference_transforms_and_owned_diagnostics(n_envs, skin_articul
     masses = mass.per_rigid_link.clone()
     mass.per_rigid_link.zero_()
     assert_equal(entity.get_mass_breakdown().per_rigid_link, masses)
+    limb_diagnostics = limb.get_binding_diagnostics()
+    # The exact local stability index of the particles bound to one free link follows from the largest eigenvalue of
+    # the spring mobility M^-1 * sum_p m_p J_p^T J_p, with J_p mapping the link twist to the particle velocity.
+    points = tensor_to_array(limb_points[0] if n_envs else limb_points, dtype=np.float64)
+    shaft_center = limb.part_rigid.get_links_pos(ref=gs.link_ref_frame.link_COM)
+    shaft_center = tensor_to_array(shaft_center[0, 0] if n_envs else shaft_center[0], dtype=np.float64)
+    shaft_quat = limb.part_rigid.get_links_quat()
+    shaft_rotation = geom.quat_to_R(tensor_to_array(shaft_quat[0, 0] if n_envs else shaft_quat[0], dtype=np.float64))
+    shaft_inertia = shaft_rotation @ (0.7 * np.diag((0.0002, 0.0075, 0.0075))) @ shaft_rotation.T
+    arms_skew = np.cross((points - shaft_center)[:, None, :], np.eye(3))
+    jacobians = np.concatenate((np.broadcast_to(np.eye(3), arms_skew.shape), arms_skew), axis=-1)
+    particle_mass = tensor_to_array(limb_diagnostics.particle_mass, dtype=np.float64)
+    spring_mobility = np.einsum("p,pia,pib->ab", particle_mass, jacobians, jacobians)
+    link_mass_matrix = np.zeros((6, 6))
+    link_mass_matrix[:3, :3] = 0.7 * np.eye(3)
+    link_mass_matrix[3:, 3:] = shaft_inertia
+    mass_matrix_factor = np.linalg.cholesky(np.linalg.inv(link_mass_matrix))
+    mobility = np.linalg.eigvalsh(mass_matrix_factor.T @ spring_mobility @ mass_matrix_factor).max()
+    dt_omega = scene.dt / 0.01
+    stability_exact = (1.0 + mobility) * (dt_omega**2 + 4.0 * dt_omega) / 2.0
+    # The bound adds the translational mobility to the rotational one, where the exact index takes the larger, and
+    # replaces the rotational spectral radius by a particle row sum. For skin spread around this slender shaft both
+    # together stay within a factor 2, while pairing every arm with the smallest principal inertia exceeds it tenfold.
+    assert (limb_diagnostics.stability_index >= stability_exact).all()
+    assert (limb_diagnostics.stability_index <= 2.0 * stability_exact).all()
+    # 70% of 1.5 kg bound to the shaft exceeds its 1 kg share of the total mass, which would leave it no rigid mass.
+    invalid_scene = gs.Scene(
+        mpm_options=gs.options.MPMOptions(
+            particle_size=0.02,
+            grid_density=32,
+            lower_bound=(-0.25, -0.25, -0.25),
+            upper_bound=(0.5, 0.5, 0.5),
+        ),
+        show_viewer=False,
+    )
+    with pytest.raises(gs.GenesisException, match="split_total binds .* to link 'shaft'"):
+        invalid_scene.add_entity(
+            morph=gs.morphs.URDF(
+                pos=(0.1, 0.35, -0.1),
+                file=skin_limb,
+            ),
+            material=gs.materials.Hybrid(
+                material_rigid=gs.materials.Rigid(),
+                material_soft=gs.materials.MPM.Elastic(
+                    E=1000.0,
+                ),
+                skin=gs.options.HybridSkinOptions(
+                    surface=trimesh.creation.box(extents=(0.3, 0.06, 0.06)),
+                    skinning={
+                        "link_names": ["shaft"],
+                        "indices": np.zeros((8, 1), dtype=gs.np_int),
+                        "weights": np.ones((8, 1)),
+                    },
+                ),
+                mass=gs.options.HybridMassOptions(
+                    mode="split_total",
+                    total_mass=1.5,
+                    soft_mass_fraction=0.7,
+                ),
+            ),
+        )
 
 
 @pytest.mark.required

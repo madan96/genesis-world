@@ -160,6 +160,15 @@ def test_surface_attribute_transfer():
     for names, regions in ((["a", "a"], [0, 0, 0]), (["a"], [0, 1, 0]), (["a"], [0.0, 0.0, 0.0])):
         with pytest.raises(gs.GenesisException):
             hybrid_skin.load_regions({"region_names": names, "vertex_region": np.array(regions)}, surface)
+    # A fan whose hub region borders 32 rim regions
+    rim_angles = np.linspace(0.0, 2.0 * np.pi, 32, endpoint=False)
+    fan = trimesh.Trimesh(
+        vertices=np.vstack(((0.0, 0.0, 0.0), np.stack((np.cos(rim_angles), np.sin(rim_angles), 0.0 * rim_angles), -1))),
+        faces=np.stack((np.full(32, 0), np.arange(1, 33), np.arange(1, 33) % 32 + 1), axis=-1),
+        process=False,
+    )
+    with pytest.raises(gs.GenesisException, match="adjacent regions"):
+        hybrid_skin.load_regions({"region_names": [str(i) for i in range(33)], "vertex_region": np.arange(33)}, fan)
 
 
 @pytest.mark.required

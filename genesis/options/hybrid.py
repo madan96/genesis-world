@@ -87,8 +87,9 @@ class HybridBindingOptions(Options):
 
     The supported local linear stability range accounts for current rigid mass, rotational inertia and both spring
     and damping lever arms. The range is checked at the simulator's error-check cadence, and a step outside it raises
-    an error: increase ``timeconst`` or reduce the substep duration. Large nonlinear deformation can require a smaller
-    step even within the local range.
+    an error: increase ``timeconst``, lower ``damping_ratio`` or reduce the substep duration. Damping uses most of the
+    range whenever ``4 * damping_ratio`` exceeds ``substep_dt / timeconst``. Large nonlinear deformation can require a
+    smaller step even within the local range.
     Spring reactions act at each bound link point; damping reactions act at the current particle point. This preserves
     spring work and total angular momentum when skin blends across independently rotating links.
     """
@@ -106,8 +107,12 @@ class HybridMassOptions(Options):
 
     ``additive`` retains both authored masses. ``rigid_total`` subtracts the particles' weighted mass, first moment,
     and inertia from their associated links at the reference pose. The remaining link inertias must be positive.
-    ``split_total`` uniformly scales rigid density and particle density to ``total_mass`` kilograms, assigning
-    ``soft_mass_fraction`` to the particles. Link centers of mass remain fixed under uniform density scaling.
+    ``split_total`` scales the authored link masses to ``total_mass`` kilograms and the particle density so that the
+    particles carry ``soft_mass_fraction`` of it. Every link keeps its scaled authored mass: the skin mass bound to it
+    by skinning weight replaces part of its rigid mass, whose inertia scales by the same ratio, so link centers of mass
+    remain fixed. Links without skin keep their scaled authored mass, and a link bound to at least that much skin mass
+    raises an error. ``rigid_total`` keeps the material densities and the exact link inertia at the cost of moving link
+    centers of mass, while ``split_total`` sets the body mass and skin fraction directly.
     """
 
     mode: Literal["additive", "rigid_total", "split_total"] = "additive"

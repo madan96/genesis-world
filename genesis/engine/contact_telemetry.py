@@ -47,6 +47,7 @@ class ContactTelemetry:
         self.links = links_type.field(shape=(max(n_links, 1), self.n_envs), layout=qd.Layout.SOA)
         # Partial sums bound accumulation error when thousands of grid contacts act on one rigid link.
         self.links_partial = links_type.field(shape=(max(n_links, 1), self.n_envs, 32), layout=qd.Layout.SOA)
+        self._all_envs_idx = torch.arange(self.n_envs, dtype=gs.tc_int, device=gs.device)
 
     @property
     def row_fields(self) -> tuple[qd.Field, ...]:
@@ -99,37 +100,26 @@ class ContactTelemetry:
         if gs.backend == gs.metal:
             torch.mps.synchronize()
 
-    def reset(self, envs_idx: torch.Tensor) -> None:
-        """Clear selected environments; previously returned snapshots remain owned."""
-        if gs.use_zerocopy:
-            for field in (self.attempted_count, self.interval):
-                view = qd_to_torch(field, transpose=True, copy=False)
-                view[envs_idx] = 0
-            for field in (
-                self.links.impulse,
-                self.links.angular_impulse,
-                self.links.normal_impulse,
-                self.links.position_weighted,
-                self.links.area_time,
-                self.links.peak_normal_impulse,
-            ):
-                view = qd_to_torch(field, transpose=True, copy=False)
-                view[envs_idx] = 0
-            if gs.backend == gs.metal:
-                torch.mps.synchronize()
-        else:
-            kernel_reset_contact_telemetry(envs_idx, self)
-        kernel_reset_contact_partials(envs_idx, self)
+    def reset(self, envs_idx: torch.Tensor | None = None, interval: float = 0.0) -> None:
+        """Clear the selected environments (all of them with None) and set their elapsed MPM interval in seconds.
 
-    def advance_interval(self, dt: float) -> None:
-        """Advance once for every completed MPM collision substep, including empty ones."""
+        Previously returned snapshots remain owned.
+        """
         if gs.use_zerocopy:
-            interval = qd_to_torch(self.interval, transpose=True, copy=False)
-            interval.add_(dt)
+            envs_selection = slice(None) if envs_idx is None else envs_idx
+            for field in (self.attempted_count, *self.link_fields):
+                view = qd_to_torch(field, transpose=True, copy=False)
+                view[envs_selection] = 0
+            interval_view = qd_to_torch(self.interval, transpose=True, copy=False)
+            interval_view[envs_selection] = interval
             if gs.backend == gs.metal:
                 torch.mps.synchronize()
         else:
-            kernel_advance_contact_interval(dt, self)
+            kernel_reset_contact_telemetry(self._all_envs_idx if envs_idx is None else envs_idx, interval, self)
+        kernel_reset_contact_partials(self._all_envs_idx if envs_idx is None else envs_idx, self)
+
+    def reduce_partials(self) -> None:
+        """Sum the per-slot partial link accumulators into ``links``; run after every MPM collision substep."""
         kernel_reduce_contact_partials(self)
 
 
@@ -172,11 +162,11 @@ def kernel_reduce_contact_partials(telemetry: qd.template()):
 
 
 @qd.kernel
-def kernel_reset_contact_telemetry(envs_idx: qd.types.ndarray(), telemetry: qd.template()):
+def kernel_reset_contact_telemetry(envs_idx: qd.types.ndarray(), interval: float, telemetry: qd.template()):
     for i_b_ in range(envs_idx.shape[0]):
         i_b = envs_idx[i_b_]
         telemetry.attempted_count[i_b] = 0
-        telemetry.interval[i_b] = 0.0
+        telemetry.interval[i_b] = interval
     for i_l, i_b_ in qd.ndrange(telemetry.n_links, envs_idx.shape[0]):
         i_b = envs_idx[i_b_]
         telemetry.links[i_l, i_b].impulse = 0.0
@@ -185,12 +175,6 @@ def kernel_reset_contact_telemetry(envs_idx: qd.types.ndarray(), telemetry: qd.t
         telemetry.links[i_l, i_b].position_weighted = 0.0
         telemetry.links[i_l, i_b].area_time = 0.0
         telemetry.links[i_l, i_b].peak_normal_impulse = 0.0
-
-
-@qd.kernel
-def kernel_advance_contact_interval(dt: float, telemetry: qd.template()):
-    for i_b in range(telemetry.n_envs):
-        telemetry.interval[i_b] += dt
 
 
 @qd.func

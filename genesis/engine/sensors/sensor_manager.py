@@ -276,7 +276,7 @@ class SensorManager:
         self._sensors_by_type.clear()
 
     def get_state(self) -> SensorManagerState:
-        """Capture owned sensor state; future stochastic draws remain under the caller's torch RNG control."""
+        """Capture owned sensor state. Restoring it rewinds no random number generator (see 'Scene.reset')."""
         return SensorManagerState(
             ground_truth_intermediate={
                 key: value.T.clone() for key, value in self._ground_truth_intermediate_cache.items()

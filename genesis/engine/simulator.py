@@ -556,12 +556,13 @@ class Simulator(RBC):
         for binding, binding_state in zip(self.mpm_solver._hybrid_bindings, state.attachments):
             binding.set_observation_state(binding_state, envs_idx)
 
-    def get_state(self):
+    def get_state(self, *, include_observations: bool = True):
         state = SimState(
             scene=self.scene,
             s_global=self.cur_step_global,
             f_local=self.cur_substep_local,
             solvers=self._solvers,
+            include_observations=include_observations,
         )
 
         # `SimState.__init__` calls `solver.get_state` on every solver, and solvers that maintain a per-solver queue

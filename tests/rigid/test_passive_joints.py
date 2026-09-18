@@ -67,25 +67,27 @@ def test_passive_actuator_coexistence(independent_scalar_joints, show_viewer, jo
         assert_allclose(model.get_passive_dofs_force(), passive, atol=3e-6)
         assert_allclose(model.get_limit_dofs_force(), limits, atol=3e-6)
         assert_allclose(model.get_applied_dofs_force(), np.clip(passive + limits, -force_limit, force_limit), atol=3e-6)
+        forces = model.get_dofs_forces()
+        assert_allclose(forces.passive, passive, atol=3e-6)
+        assert_allclose(forces.limit, limits, atol=3e-6)
+        assert_allclose(forces.applied, np.clip(passive + limits, -force_limit, force_limit), atol=3e-6)
         assert (np.abs(passive + limits) > force_limit).any()
         for _ in range(2):
-            force = (
-                np.clip(command, -0.25, 0.25)
-                + np.clip(
-                    -stiffness * (position - [0.1, -0.2])
-                    - [0.4, 0.5] * velocity
-                    - [0.1, 0.2] * np.tanh(velocity / 0.05)
-                    + [4, 5]
-                    * (np.maximum([-0.15, -0.3] - position, 0) ** 2 - np.maximum(position - [0.25, 0.4], 0) ** 2),
-                    -force_limit,
-                    force_limit,
-                )
-                - [0.6, 0.8] * position
-                - [0.1, 0.2] * velocity
+            elastic = -stiffness * (position - [0.1, -0.2]) + [4, 5] * (
+                np.maximum([-0.15, -0.3] - position, 0) ** 2 - np.maximum(position - [0.25, 0.4], 0) ** 2
             )
+            applied = np.clip(
+                elastic - [0.4, 0.5] * velocity - [0.1, 0.2] * np.tanh(velocity / 0.05), -force_limit, force_limit
+            )
+            # The substep integrates implicitly the slope of the chord of the applied force from zero to the current
+            # velocity, whose limit at rest is the damping plus friction / friction_vel_eps unless the force saturates.
+            slope = np.where(np.abs(elastic) < force_limit, [0.4, 0.5] + np.array([0.1, 0.2]) / 0.05, 0.0)
+            rest = np.clip(elastic, -force_limit, force_limit)
+            np.divide(rest - applied, velocity, out=slope, where=np.abs(velocity) > gs.EPS)
+            force = np.clip(command, -0.25, 0.25) + applied - [0.6, 0.8] * position - [0.1, 0.2] * velocity
             force[:, 0] -= position[:, 0]
             # Revolute inertia is 2/5 * 2 * 0.2^2 + armature 0.068 = 0.1; each slider has mass 0.1.
-            velocity += 0.001 * force / (0.1 + 0.001 * np.array([0.1, 0.2]))
+            velocity += 0.001 * force / (0.1 + 0.001 * ([0.1, 0.2] + slope))
             position += 0.001 * velocity
         scene.step()
         assert_allclose(entity.get_dofs_control_force(), np.tile(np.clip(command, -0.25, 0.25), (2, 1)), atol=1e-7)
@@ -180,14 +182,19 @@ def test_coupled_limit_potentials(independent_scalar_joints, show_viewer, tmp_pa
 
 
 @pytest.mark.required
-def test_passive_dissipation(independent_scalar_joints, show_viewer):
+@pytest.mark.parametrize(
+    "integrator", [gs.integrator.Euler, gs.integrator.implicitfast, gs.integrator.approximate_implicitfast]
+)
+@pytest.mark.parametrize("dt, substeps", [(2e-4, 1), (1 / 120, 2), (0.004, 2)])
+def test_passive_dissipation(independent_scalar_joints, light_hinge, show_viewer, integrator, dt, substeps):
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
-            dt=0.001,
+            dt=dt,
+            substeps=substeps,
             gravity=(0, 0, 0),
         ),
         rigid_options=gs.options.RigidOptions(
-            integrator=gs.integrator.Euler,
+            integrator=integrator,
             use_hibernation=True,
         ),
         show_viewer=show_viewer,
@@ -197,21 +204,52 @@ def test_passive_dissipation(independent_scalar_joints, show_viewer):
             file=independent_scalar_joints(),
         ),
     )
+    hand = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file=light_hinge,
+            default_armature=0.0,
+        ),
+    )
     model = entity.configure_passive_joints()
+    wrist = hand.configure_passive_joints()
     scene.build()
     model.set_params(damping=[2, 3], friction=[0.2, 0.5])
+    hand.set_dofs_damping(1.5)
+    wrist.set_params(damping=0.15, friction=0.3)
     entity.set_dofs_velocity([2, -3])
+    hand.set_dofs_velocity(0.5)
     energy = entity.get_kinetic_energy()
-    for _ in range(8):
+    hand_velocity = hand.get_dofs_velocity()
+    for _ in range(10):
         assert (model.get_passive_dofs_force() * entity.get_dofs_velocity() <= 0).all()
         scene.step()
         next_energy = entity.get_kinetic_energy()
         assert next_energy < energy
         energy = next_energy
-    assert energy < 0.7 * 0.5 * 0.1 * (2**2 + 3**2)
+        next_hand_velocity = hand.get_dofs_velocity()
+        assert ((0.0 <= next_hand_velocity) & (next_hand_velocity <= hand_velocity)).all()
+        hand_velocity = next_hand_velocity
+    # Damping alone scales each velocity by 1 / (1 + h * damping / inertia) per substep, and friction removes more.
+    h = dt / substeps
+    assert energy < 0.5 * 0.1 * np.sum(np.array([2, 3]) ** 2 * (1 + h * np.array([2, 3]) / 0.1) ** (-20 * substeps))
+    assert_allclose(hand_velocity, 0.0, atol=1e-6)
     scene.reset()
     for _ in range(12):
         scene.step()
+    # The implicit damping and friction slope at rest enter the mass matrix under approximate_implicitfast only, and a
+    # hibernated entity keeps it unchanged.
+    mass_diag = np.full(2, 0.1)
+    if integrator == gs.integrator.approximate_implicitfast:
+        mass_diag += h * (np.array([2, 3]) + np.array([0.2, 0.5]) / 0.05)
+    assert_allclose(entity.get_mass_mat(), np.diag(mass_diag), tol=gs.EPS)
     model.set_params(q_neutral=[0.3, -0.2], k_neutral=[2, 3])
     scene.step()
-    assert_allclose(entity.get_dofs_velocity(), [0.006, -0.006], atol=2e-7)
+    # Each substep integrates the damping and the friction chord slope at the current velocity implicitly.
+    position, velocity = np.zeros(2), np.zeros(2)
+    for _ in range(substeps):
+        ratio = np.ones(2)
+        np.divide(np.tanh(velocity / 0.05), velocity / 0.05, out=ratio, where=np.abs(velocity) > gs.EPS)
+        force = -np.array([2, 3]) * (position - [0.3, -0.2]) - [2, 3] * velocity - [0.2, 0.5] * np.tanh(velocity / 0.05)
+        velocity += h * force / (0.1 + h * ([2, 3] + np.array([0.2, 0.5]) * ratio / 0.05))
+        position += h * velocity
+    assert_allclose(entity.get_dofs_velocity(), velocity, atol=2e-7)

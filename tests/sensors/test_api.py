@@ -35,6 +35,14 @@ def test_selected_sensor_parameters(show_viewer):
         for _ in range(2)
     ]
     scene.build(n_envs=2)
+    for setter in (sensors[0].set_noise, sensors[0].set_random_walk, sensors[0].set_resolution):
+        for value in (float("nan"), float("inf"), -1.0):
+            with pytest.raises(gs.GenesisException):
+                setter(value, envs_idx=[0])
+    for setter in (sensors[0].set_bias, sensors[0].set_jitter):
+        for value in (float("nan"), float("inf")):
+            with pytest.raises(gs.GenesisException):
+                setter(value, envs_idx=[0])
     sensors[0].set_bias([1, 2, 3, 0, 0, 0, 0, 0, 0], envs_idx=[0])
     sensors[1].set_bias([-1, -2, -3, 0, 0, 0, 0, 0, 0], envs_idx=[1])
     sensors[0].set_quat_offset([np.sqrt(0.5), 0, 0, np.sqrt(0.5)], envs_idx=[0])
@@ -654,6 +662,26 @@ def test_sensor_history_length_contact_and_imu(show_viewer, tol, n_envs):
             assert_allclose(ig.mag[prev_slice], prev_i.mag[cur_slice], tol=gs.EPS)
         prev_c = cg
         prev_i = ig
+
+
+@pytest.mark.required
+def test_bare_reset_without_build_observation_capture(show_viewer):
+    # A bare reset clears sensor histories rather than restoring them, so the build keeps no copy of them. The box
+    # rests on the plane, so its accelerometer reads the support reaction once stepping starts.
+    scene = gs.Scene(show_viewer=show_viewer)
+    scene.add_entity(gs.morphs.Plane())
+    box = scene.add_entity(gs.morphs.Box(size=(0.1, 0.1, 0.1), pos=(0.0, 0.0, 0.05)))
+    imu = scene.add_sensor(gs.sensors.IMU(entity_idx=box.idx, history_length=3))
+    scene.build()
+    assert scene._init_state.sensor_state is None
+    assert scene._init_state.contact_state is None
+
+    built_reading = imu.read_ground_truth().lin_acc.clone()
+    for _ in range(5):
+        scene.step()
+    assert not torch.equal(imu.read_ground_truth().lin_acc, built_reading)
+    scene.reset()
+    assert_equal(imu.read_ground_truth().lin_acc, built_reading)
 
 
 @pytest.mark.required

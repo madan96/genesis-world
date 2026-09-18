@@ -9,7 +9,13 @@ from genesis.repr_base import RBC
 from genesis.typing import LaxPositiveFArrayType
 from genesis.utils.misc import DeprecationError, qd_to_torch
 
-from .description import KinematicLinkDescription, RigidGeomDescription, RigidLinkDescription, RigidVisGeomDescription
+from .description import (
+    KinematicLinkDescription,
+    KinematicVariantLinkDescription,
+    RigidGeomDescription,
+    RigidLinkDescription,
+    RigidVisGeomDescription,
+)
 from .inertial import LinkInertial
 from .rigid_geom import RigidGeom, RigidVisGeom
 
@@ -334,6 +340,15 @@ class KinematicLink(RBC):
         return self.desc.is_aligned
 
     @property
+    def variants_desc(self) -> list[KinematicLinkDescription | KinematicVariantLinkDescription]:
+        """
+        The description of the link in each heterogeneous variant of its entity, the primary's own first, which a
+        homogeneous entity holds alone. Each one holds the frame the link stands at in that variant and, for a rigid
+        link, the inertial it is simulated with.
+        """
+        return [self.desc, *(variant.links[self.idx_local] for variant in self._entity.desc.variants[1:])]
+
+    @property
     def vgeoms(self) -> list[RigidVisGeom]:
         """
         The list of the link's visualization geometries (`RigidVisGeom`).
@@ -474,13 +489,9 @@ class RigidLink(KinematicLink):
         # Compute per-variant inertial for heterogeneous links
         if self._variant_geom_ranges is not None:
             self._variant_inertial = [
-                LinkInertial(self.desc.mass, self.desc.inertial_pos, self.desc.inertial_quat, self.desc.inertia)
+                LinkInertial(desc.mass, desc.inertial_pos, desc.inertial_quat, desc.inertia)
+                for desc in self.variants_desc
             ]
-            for variant in self.entity._desc.variants[1:]:
-                v_l_desc = variant.links[self.idx - self.entity._link_start]
-                self._variant_inertial.append(
-                    LinkInertial(v_l_desc.mass, v_l_desc.inertial_pos, v_l_desc.inertial_quat, v_l_desc.inertia)
-                )
 
     def _add_geom(self, desc: RigidGeomDescription, needs_coup=False):
         geom = RigidGeom(

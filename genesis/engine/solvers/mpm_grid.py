@@ -1,12 +1,19 @@
 import numpy as np
+from scipy.spatial import cKDTree
 
 import quadrants as qd
 
 import genesis as gs
+from genesis.utils import hybrid_skin
 
 
 class GridRegions:
-    """MPM contact fields and their scene-entity, semantic-region and surface-contact identities."""
+    """MPM contact fields and their scene-entity, semantic-region, surface-contact and seam identities.
+
+    Fields of one semantic region always share grid velocities. Two regions of one skin that meet on a surface triangle
+    share them only at grid nodes where both carry particles of their common seam band, so the skin stays one continuum
+    at the seam while parts of the two regions that meet elsewhere contact each other.
+    """
 
     def __init__(self, solver):
         bindings = {binding.part_soft.idx: binding for binding in solver._hybrid_bindings}
@@ -42,6 +49,8 @@ class GridRegions:
             fields_by_entity[entity.idx] = fields
         self.n_regions = len(self.names)
         is_bonded = np.eye(self.n_regions, dtype=bool)
+        seam_bit = np.zeros((self.n_regions, self.n_regions), dtype=gs.np_int)
+        particles_seam_mask = np.zeros(solver.n_particles, dtype=gs.np_int)
         is_collision_enabled = np.ones((self.n_regions, max(1, solver.sim.rigid_solver.n_geoms)), dtype=bool)
         for binding in solver._hybrid_bindings:
             fields = fields_by_entity[binding.part_soft.idx]
@@ -49,13 +58,26 @@ class GridRegions:
             unknown = set(region_overrides) - set(binding.region_names)
             if unknown:
                 gs.raise_exception(f"Unknown Hybrid collision regions: {sorted(unknown)}.")
-            adjacent = np.eye(len(binding.region_names), dtype=bool)
+            # Each region numbers the regions it meets on the surface and marks the seam with each of them by one bit.
+            # A particle of region i belongs to its seam band with region j when a particle of j lies closer than three
+            # cells along every axis in the reference configuration, the widest separation at which two quadratic
+            # B-spline stencils still share a node. Every node the two regions share at rest thus carries both bands
+            # and bonds as in a single continuum, whereas skin that only meets after deforming contacts instead.
+            regions_seam_bit = np.zeros((len(binding.region_names), len(binding.region_names)), dtype=gs.np_int)
             if binding.vertex_regions is not None:
-                triangles = binding.vertex_regions[binding.surface_world.faces]
-                for i_corner in range(3):
-                    for j_corner in range(i_corner + 1, 3):
-                        adjacent[triangles[:, i_corner], triangles[:, j_corner]] = True
-                        adjacent[triangles[:, j_corner], triangles[:, i_corner]] = True
+                is_adjacent = hybrid_skin.region_adjacency(
+                    binding.vertex_regions, binding.surface_world.faces, len(binding.region_names)
+                )
+                for i_r in range(len(binding.region_names)):
+                    regions_seam_bit[i_r, is_adjacent[i_r]] = 1 << np.arange(is_adjacent[i_r].sum())
+                particles = binding.part_soft.init_particles
+                for i_r, j_r in np.argwhere(is_adjacent):
+                    particles_idx = np.flatnonzero(binding.particles_region == i_r)
+                    distance, _ = cKDTree(particles[binding.particles_region == j_r]).query(
+                        particles[particles_idx], p=np.inf, distance_upper_bound=3.0 * solver.dx
+                    )
+                    seam_idx = binding.part_soft.particle_start + particles_idx[np.isfinite(distance)]
+                    particles_seam_mask[seam_idx] |= regions_seam_bit[i_r, j_r]
             neighbors = {link.idx: {link.idx} for link in binding.part_rigid.links}
             for link in binding.part_rigid.links:
                 if link.parent_idx >= 0:
@@ -74,7 +96,8 @@ class GridRegions:
                         for geom in link.geoms:
                             is_collision_enabled[i_field, geom.idx] = False
                 for j_field, j_r in fields:
-                    is_bonded[i_field, j_field] = adjacent[i_r, j_r]
+                    is_bonded[i_field, j_field] = i_r == j_r
+                    seam_bit[i_field, j_field] = regions_seam_bit[i_r, j_r]
         self.entity_idx = qd.field(gs.qd_int, shape=self.n_regions)
         self.region_idx = qd.field(gs.qd_int, shape=self.n_regions)
         self.is_surface_contact = qd.field(gs.qd_bool, shape=self.n_regions)
@@ -85,28 +108,54 @@ class GridRegions:
         self.is_surface_contact.from_numpy(np.array(surface_contact, dtype=bool))
         self.is_bonded.from_numpy(is_bonded)
         self.is_collision_enabled.from_numpy(is_collision_enabled)
+        # Only a skin whose regions meet has seams, and every seam access sits under a static 'has_seams' gate.
+        self.has_seams = bool(seam_bit.any())
+        self.seam_bit = None
+        self.particles_seam_mask = None
+        if self.has_seams:
+            self.seam_bit = qd.field(gs.qd_int, shape=(self.n_regions, self.n_regions))
+            self.particles_seam_mask = qd.field(gs.qd_int, shape=solver.n_particles)
+            self.seam_bit.from_numpy(seam_bit)
+            self.particles_seam_mask.from_numpy(particles_seam_mask)
 
 
 @qd.kernel
 def kernel_particle_bounds(f: qd.i32, solver: qd.template()):
-    for i_b in range(solver._B):
-        solver.particles_lower[i_b] = np.inf
-        solver.particles_upper[i_b] = -np.inf
-        solver.active_particles[i_b] = 0
-    for i_p, i_b in qd.ndrange(solver.n_particles, solver._B):
-        if solver.particles_ng[f, i_p, i_b].active:
-            position = solver.particles.pos[f, i_p, i_b]
-            is_finite = True
-            for i_axis in qd.static(range(3)):
-                if qd.math.isnan(position[i_axis]) or qd.math.isinf(position[i_axis]):
-                    is_finite = False
-            if is_finite:
+    # Atomic min/max of floats onto the per-environment bounds would serialize every particle of an environment on the
+    # same few words. Each chunk instead reduces a strided subset of the particles in registers, then one thread per
+    # environment reduces the chunk partials.
+    for i_chunk, i_b in qd.ndrange(solver._n_bounds_chunks, solver._B):
+        lower = qd.Vector([np.inf, np.inf, np.inf], dt=gs.qd_float)
+        upper = -lower
+        n_active = 0
+        for i_p_ in range((solver.n_particles - i_chunk + solver._n_bounds_chunks - 1) // solver._n_bounds_chunks):
+            i_p = i_p_ * solver._n_bounds_chunks + i_chunk
+            if solver.particles_ng[f, i_p, i_b].active:
+                position = solver.particles.pos[f, i_p, i_b]
+                is_finite = True
                 for i_axis in qd.static(range(3)):
-                    qd.atomic_min(solver.particles_lower[i_b][i_axis], position[i_axis])
-                    qd.atomic_max(solver.particles_upper[i_b][i_axis], position[i_axis])
-                qd.atomic_add(solver.active_particles[i_b], 1)
-            else:
-                qd.atomic_or(solver.window_errno[i_b], 2)
+                    if qd.math.isnan(position[i_axis]) or qd.math.isinf(position[i_axis]):
+                        is_finite = False
+                if is_finite:
+                    lower = qd.min(lower, position)
+                    upper = qd.max(upper, position)
+                    n_active += 1
+                else:
+                    qd.atomic_or(solver.window_errno[i_b], 2)
+        solver.particles_bounds_chunks[i_chunk, i_b].lower = lower
+        solver.particles_bounds_chunks[i_chunk, i_b].upper = upper
+        solver.particles_bounds_chunks[i_chunk, i_b].n_active = n_active
+    for i_b in range(solver._B):
+        lower = qd.Vector([np.inf, np.inf, np.inf], dt=gs.qd_float)
+        upper = -lower
+        n_active = 0
+        for i_chunk in range(solver._n_bounds_chunks):
+            lower = qd.min(lower, solver.particles_bounds_chunks[i_chunk, i_b].lower)
+            upper = qd.max(upper, solver.particles_bounds_chunks[i_chunk, i_b].upper)
+            n_active += solver.particles_bounds_chunks[i_chunk, i_b].n_active
+        solver.particles_lower[i_b] = lower
+        solver.particles_upper[i_b] = upper
+        solver.active_particles[i_b] = n_active
 
 
 @qd.kernel
@@ -139,12 +188,13 @@ def kernel_contact_grid_fields(f: qd.i32, solver: qd.template()):
         j = remaining % solver._grid_res[1]
         i = remaining // solver._grid_res[1]
         cell = qd.Vector([i, j, k])
-        for i_r in range(solver.regions.n_regions):
-            mass = solver.grid[f, cell, i_r, i_b].mass
+        # Every node with mass gets its velocity here, including the nodes at or below the mass threshold of the
+        # coupler's grid operation, which g2p still reads. A multi-region grid first resolves contact between regions.
+        if qd.static(solver.regions.n_regions == 1):
+            mass = solver.grid[f, cell, 0, i_b].mass
             if mass > 0.0:
-                solver.grid[f, cell, i_r, i_b].vel_out = solver.grid[f, cell, i_r, i_b].vel_in / mass
-                solver.active_cell_count[i_b] += 1
-        if qd.static(solver.regions.n_regions > 1):
+                solver.grid[f, cell, 0, i_b].vel_out = solver.grid[f, cell, 0, i_b].vel_in / mass
+        else:
             # Connected components use only regions with mass at this node. An absent intermediate region therefore
             # cannot weld two separated parts of the same continuous skin
             parent = qd.Vector.zero(gs.qd_int, solver.regions.n_regions)
@@ -153,32 +203,46 @@ def kernel_contact_grid_fields(f: qd.i32, solver: qd.template()):
             for i_r in range(solver.regions.n_regions):
                 if solver.grid[f, cell, i_r, i_b].mass > 0.0:
                     for j_r in range(i_r + 1, solver.regions.n_regions):
-                        if solver.grid[f, cell, j_r, i_b].mass > 0.0 and solver.regions.is_bonded[i_r, j_r]:
-                            root_a = i_r
-                            root_b = j_r
-                            while parent[root_a] != root_a:
-                                root_a = parent[root_a]
-                            while parent[root_b] != root_b:
-                                root_b = parent[root_b]
-                            parent[qd.max(root_a, root_b)] = qd.min(root_a, root_b)
+                        if solver.grid[f, cell, j_r, i_b].mass > 0.0:
+                            is_joined = solver.regions.is_bonded[i_r, j_r]
+                            # Regions of one skin that meet on its surface join only where each carries particles of
+                            # their common seam band (see GridRegions).
+                            if qd.static(solver.regions.has_seams):
+                                seam_bit_ij = solver.regions.seam_bit[i_r, j_r]
+                                if seam_bit_ij != 0:
+                                    seam_bit_ji = solver.regions.seam_bit[j_r, i_r]
+                                    is_joined = (solver.grid_seam_mask[f, cell, i_r, i_b] & seam_bit_ij) != 0 and (
+                                        solver.grid_seam_mask[f, cell, j_r, i_b] & seam_bit_ji
+                                    ) != 0
+                            if is_joined:
+                                root_a = i_r
+                                root_b = j_r
+                                while parent[root_a] != root_a:
+                                    root_a = parent[root_a]
+                                while parent[root_b] != root_b:
+                                    root_b = parent[root_b]
+                                parent[qd.max(root_a, root_b)] = qd.min(root_a, root_b)
             masses = qd.Vector.zero(gs.qd_float, solver.regions.n_regions)
             momenta = qd.Matrix.zero(gs.qd_float, solver.regions.n_regions, 3)
             gradients = qd.Matrix.zero(gs.qd_float, solver.regions.n_regions, 3)
             frictions = qd.Vector.zero(gs.qd_float, solver.regions.n_regions)
             surface_contact = qd.Vector.zero(gs.qd_int, solver.regions.n_regions)
+            # A region without mass at this node remains its own component, which neither the contact impulses nor the
+            # velocity update read, so only the occupied regions are aggregated.
             for i_r in range(solver.regions.n_regions):
-                root = i_r
-                while parent[root] != root:
-                    root = parent[root]
-                parent[i_r] = root
                 mass = solver.grid[f, cell, i_r, i_b].mass
-                masses[root] += mass
-                frictions[root] += solver.grid[f, cell, i_r, i_b].friction_mass
-                if mass > 0.0 and solver.regions.is_surface_contact[i_r]:
-                    surface_contact[root] = 1
-                for i_axis in qd.static(range(3)):
-                    momenta[root, i_axis] += solver.grid[f, cell, i_r, i_b].vel_in[i_axis]
-                    gradients[root, i_axis] += solver.grid[f, cell, i_r, i_b].mass_gradient[i_axis]
+                if mass > 0.0:
+                    root = i_r
+                    while parent[root] != root:
+                        root = parent[root]
+                    parent[i_r] = root
+                    masses[root] += mass
+                    frictions[root] += solver.grid_contact[f, cell, i_r, i_b].friction_mass
+                    if solver.regions.is_surface_contact[i_r]:
+                        surface_contact[root] = 1
+                    for i_axis in qd.static(range(3)):
+                        momenta[root, i_axis] += solver.grid[f, cell, i_r, i_b].vel_in[i_axis]
+                        gradients[root, i_axis] += solver.grid_contact[f, cell, i_r, i_b].mass_gradient[i_axis]
             for i_r in range(solver.regions.n_regions):
                 if masses[i_r] > 0.0 and surface_contact[i_r]:
                     for j_r in range(i_r + 1, solver.regions.n_regions):
@@ -215,8 +279,8 @@ def kernel_contact_grid_fields(f: qd.i32, solver: qd.template()):
                                         momenta[i_r, i_axis] += impulse[i_axis]
                                         momenta[j_r, i_axis] -= impulse[i_axis]
             for i_r in range(solver.regions.n_regions):
-                root = parent[i_r]
                 if solver.grid[f, cell, i_r, i_b].mass > 0.0:
+                    root = parent[i_r]
                     for i_axis in qd.static(range(3)):
                         solver.grid[f, cell, i_r, i_b].vel_out[i_axis] = momenta[root, i_axis] / masses[root]
 

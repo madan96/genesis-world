@@ -479,6 +479,7 @@ def test_constraint_solver_backward_matches_fd(monkeypatch):
         rigid_solver.rigid_config,
         is_forward_pos_updated=True,
         is_forward_vel_updated=True,
+        is_mass_mat_updated=False,
         is_backward=False,
     )
     constraint_solver.add_equality_constraints()

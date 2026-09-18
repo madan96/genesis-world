@@ -350,6 +350,12 @@ def test_overflow_sample_delay_and_recovery(n_envs, show_viewer):
         material=gs.materials.MPM.Elastic(E=1000, rho=1000, sampler="regular"),
     )
     floor = scene.add_entity(gs.morphs.Plane(), material=gs.materials.Rigid(coup_friction=0))
+    box = scene.add_entity(
+        gs.morphs.Box(
+            size=(0.05, 0.05, 0.05),
+            pos=(-0.15, -0.15, 0.025),
+        ),
+    )
     sensor = scene.add_sensor(
         gs.sensors.SolverContactTaxel(
             entity_idx=floor.idx,
@@ -366,7 +372,29 @@ def test_overflow_sample_delay_and_recovery(n_envs, show_viewer):
             ),
         )
     )
+    # Both sources make an overflow of the soft contacts invalidate these readings of the rigid box load.
+    box_options = {
+        "entity_idx": floor.idx,
+        "probe_local_pos": ((-0.15, -0.15, 0),),
+        "probe_local_normal": (0, 0, 1),
+        "probe_radius": 0.05,
+        "filter_entities": (box.idx,),
+    }
+    filtered = scene.add_sensor(
+        gs.sensors.SolverContactTaxel(
+            **box_options,
+            hardware_profile=gs.sensors.TactileHardwareProfile(filter_tau=5 * DT),
+        )
+    )
+    hysteretic = scene.add_sensor(
+        gs.sensors.SolverContactTaxel(
+            **box_options,
+            hysteresis_strength=0.25,
+            hysteresis_tau=5 * DT,
+        )
+    )
     scene.build(n_envs=n_envs)
+    box.control_dofs_force((0, 0, -10, 0, 0, 0))
     selected = [0] if n_envs else None
     soft.set_particles_vel((0, 0, -1), envs_idx=selected)
     scene.step()
@@ -391,6 +419,30 @@ def test_overflow_sample_delay_and_recovery(n_envs, show_viewer):
     assert_equal(sensor.read().force, 0)
     assert sensor.is_complete.all()
     assert_equal(floor.get_links_contact_wrench(source="hybrid").force, 0)
+
+    # An isolated overflow holds the filter and hysteresis states, so the recurrences resume from the last complete step.
+    filtered_before = filtered.read(envs_idx=selected).force
+    hysteretic_before = hysteretic.read(envs_idx=selected).force
+    load_before = hysteretic.read_ground_truth(envs_idx=selected).force
+    assert (load_before[..., 2] < 0).all()
+    soft.set_particles_active(True, envs_idx=selected)
+    soft.set_particles_vel((0, 0, -1), envs_idx=selected)
+    scene.step()
+    assert torch.isnan(filtered.read(envs_idx=selected).force).all()
+    assert torch.isnan(hysteretic.read(envs_idx=selected).force).all()
+    soft.set_particles_active(False)
+    scene.step()
+    load = filtered.read_ground_truth(envs_idx=selected).force
+    filter_alpha = -math.expm1(-DT / (5 * DT))
+    assert_allclose(
+        filtered.read(envs_idx=selected).force, filtered_before + filter_alpha * (load - filtered_before), atol=1e-4
+    )
+    hysteresis_decay = math.exp(-DT / (5 * DT))
+    assert_allclose(
+        hysteretic.read(envs_idx=selected).force,
+        load + hysteresis_decay * (hysteretic_before - load_before) + 0.25 * (load - load_before),
+        atol=1e-4,
+    )
     scene.reset(envs_idx=selected)
     assert_equal(sensor.read(envs_idx=selected).force, 0)
     assert sensor.is_complete.all()

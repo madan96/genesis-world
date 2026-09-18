@@ -7,13 +7,13 @@ import trimesh
 import quadrants as qd
 
 import genesis as gs
-from genesis.engine.states.contacts import HybridAttachmentState, restore_contact_field
 from genesis.engine.hybrid_attachment import kernel_apply_attachment, kernel_attachment_stability
 from genesis.engine.materials.base import Material
+from genesis.engine.states.contacts import HybridAttachmentState, restore_contact_field
 from genesis.options.hybrid import HybridBindingOptions, HybridCollisionOptions, HybridMassOptions, HybridSkinOptions
 from genesis.options.solvers import LegacyCouplerOptions
 from genesis.utils import geom, hybrid_skin
-from genesis.utils.misc import assign_indexed_tensor, indices_to_mask, qd_to_torch
+from genesis.utils.misc import qd_to_torch
 
 
 @dataclass
@@ -284,9 +284,19 @@ class HybridBinding:
                 soft_material.rho *= density_ratio
             particle_mass *= density_ratio
             shares *= density_ratio
-            ratio = (self.mass_options.total_mass - soft_target) / masses.sum()
-            for link in links:
-                if link.desc.mass is not None and link.desc.mass > 0.0:
+            # Every link keeps its authored fraction of total_mass, the skin bound to it included. A single ratio over
+            # all links would move the skin mass of heavily covered links onto uncovered ones.
+            links_mass = masses * (self.mass_options.total_mass / masses.sum())
+            for i_l, link in enumerate(links):
+                if shares[i_l] > 0.0 and shares[i_l] >= links_mass[i_l]:
+                    gs.raise_exception(
+                        f"Hybrid split_total binds {shares[i_l]:.4g} kg of skin to link '{link.name}', at least its "
+                        f"{links_mass[i_l]:.4g} kg share of total_mass. Lower soft_mass_fraction or bind less skin to "
+                        "this link."
+                    )
+                if masses[i_l] > 0.0:
+                    # Uniform density scaling keeps the link center of mass and principal axes.
+                    ratio = (links_mass[i_l] - shares[i_l]) / masses[i_l]
                     link.desc.mass *= ratio
                     link.desc.inertia = np.asarray(link.desc.inertia) * ratio
                     link.desc.invweight[:] = -1.0
@@ -363,14 +373,17 @@ class HybridBinding:
         self.spring_potential = qd.field(gs.qd_float, shape=n_envs)
         self.mobility_bound = qd.field(gs.qd_float, shape=n_envs)
         self.stability_index = qd.field(gs.qd_float, shape=n_envs)
-        self.link_soft_mass = qd.field(gs.qd_float, shape=(self.part_rigid.n_links, n_envs))
-        self.link_weighted_radius = qd.field(gs.qd_float, shape=(self.part_rigid.n_links, n_envs))
-        self.interval = torch.zeros(n_envs, dtype=gs.tc_float, device=gs.device)
+        # The stability bound takes the soft mass of every particle, inactive ones included, which keeps it conservative.
+        self.link_soft_mass = qd.field(gs.qd_float, shape=(self.part_rigid.n_links,))
+        self.link_soft_mass.from_numpy(self.soft_mass_by_link.astype(gs.np_float))
+        self.link_weighted_lever = qd.field(gs.qd_float, shape=(self.part_rigid.n_links, n_envs))
+        # Seconds of attachment accumulated in the link impulses, per environment since a partial reset or snapshot
+        # restore leaves the other environments' impulses in place.
+        self.interval = qd.field(gs.qd_float, shape=n_envs)
         self.links_idx_tensor = torch.tensor(self.links_idx, dtype=gs.tc_int, device=gs.device)
         self.weights_tensor = torch.tensor(self.weights, dtype=gs.tc_float, device=gs.device)
         self.active_count_tensor = torch.tensor(self.active_count, dtype=gs.tc_int, device=gs.device)
         self.regions_tensor = torch.tensor(self.particles_region, dtype=gs.tc_int, device=gs.device)
-        self.soft_mass_by_link_tensor = torch.tensor(self.soft_mass_by_link, dtype=gs.tc_float, device=gs.device)
         self.particle_mass_tensor = torch.tensor(self.particle_mass, dtype=gs.tc_float, device=gs.device)
         self.particle_material_id_tensor = torch.tensor(self.particle_material_id, dtype=gs.tc_int, device=gs.device)
         self.particle_surface_contact_tensor = torch.tensor(
@@ -389,27 +402,24 @@ class HybridBinding:
             self.damping_work,
             self.spring_potential,
             self.stability_index,
+            self.interval,
         )
 
     def get_observation_state(self) -> HybridAttachmentState:
         """Capture owned attachment diagnostics and the interval defining their wrench."""
         return HybridAttachmentState(
-            *(qd_to_torch(field, transpose=True, copy=True) for field in self.observation_fields),
-            self.interval.clone(),
+            *(qd_to_torch(field, transpose=True, copy=True) for field in self.observation_fields)
         )
 
     def set_observation_state(self, state: HybridAttachmentState, envs_idx=None) -> None:
         """Restore selected attachment diagnostics, retaining other environments' observations."""
-        for field, value in zip(self.observation_fields, state[:-1]):
+        for field, value in zip(self.observation_fields, state, strict=True):
             restore_contact_field(field, value, envs_idx)
-        mask = indices_to_mask(envs_idx)
-        assign_indexed_tensor(self.interval, mask, state.interval[mask])
         if gs.backend == gs.metal:
             torch.mps.synchronize()
 
     def reset(self, envs_idx):
         kernel_reset_attachment(envs_idx, self)
-        self.interval[envs_idx] = 0.0
 
     def apply_attachment(self, f, phase):
         if phase != self.options.phase:
@@ -422,11 +432,10 @@ class HybridBinding:
             if torch.any(~torch.isfinite(stability) | (stability > 1.0)):
                 gs.raise_exception(
                     "Hybrid attachment exceeds its supported local stability range for the current mass, inertia and "
-                    "geometry. Increase binding.timeconst or reduce the simulation substep duration."
+                    "geometry. Increase binding.timeconst, lower binding.damping_ratio or reduce the simulation substep "
+                    "duration."
                 )
-        self.spring_potential.fill(0.0)
         kernel_apply_attachment(f, rigid.dyn_state.links, self)
-        self.interval += self.part_soft.solver.substep_dt
 
     def get_mass_breakdown(self) -> HybridMassBreakdown:
         rigid = self.part_rigid
@@ -448,7 +457,7 @@ class HybridBinding:
             rigid_total,
             soft_total,
             masses.clone(),
-            self.soft_mass_by_link_tensor.expand(masses.shape).clone(),
+            qd_to_torch(self.link_soft_mass).expand(masses.shape).clone(),
             center,
             tuple(link.name for link in rigid.links),
         )
@@ -472,7 +481,7 @@ class HybridBinding:
         )
 
     def get_attachment_link_wrench(self) -> tuple[torch.Tensor, torch.Tensor]:
-        interval = self.interval.clamp_min(torch.finfo(gs.tc_float).tiny)[:, None, None]
+        interval = qd_to_torch(self.interval).clamp_min(torch.finfo(gs.tc_float).tiny)[:, None, None]
         return (
             qd_to_torch(self.link_impulse, transpose=True, copy=True) / interval,
             qd_to_torch(self.link_angular_impulse, transpose=True, copy=True) / interval,
@@ -525,6 +534,7 @@ def kernel_reset_attachment(envs_idx: qd.types.ndarray(), binding: qd.template()
         binding.particle_angular_impulse[i_b] = 0.0
         binding.damping_work[i_b] = 0.0
         binding.spring_potential[i_b] = 0.0
+        binding.interval[i_b] = 0.0
         for i_l in range(binding.part_rigid.n_links):
             binding.link_impulse[i_l, i_b] = 0.0
             binding.link_angular_impulse[i_l, i_b] = 0.0

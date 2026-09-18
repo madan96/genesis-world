@@ -210,7 +210,12 @@ class RigidEqualityDescription:
 
 @dataclass(kw_only=True)
 class KinematicVariantLinkDescription:
-    """The parent-relative frame and visual geometry of one link in a heterogeneous variant."""
+    """The parent-relative frame and visual geometry of one link in a heterogeneous variant.
+
+    A root link holds the frame of the primary, which its entity simulates in every environment: a free root takes the
+    pose of each variant from that variant's initial configuration, and a root without a free joint stands where the
+    primary's stands, which '_load_heterogeneous_morphs' requires of every variant.
+    """
 
     pos: np.ndarray
     quat: np.ndarray
@@ -437,6 +442,7 @@ class KinematicEntityDescription(EntityDescription):
         )
 
         n_links = len(self.links)
+        is_root_free = any(j_desc.type == gs.JOINT_TYPE.FREE for j_desc in self.links[0].joints)
 
         # Load additional heterogeneous variants
         for morph in self.morphs[1:]:
@@ -481,11 +487,19 @@ class KinematicEntityDescription(EntityDescription):
                             ("dofs_motion_ang", p_joint.dofs_motion_ang, variant_joint.dofs_motion_ang),
                             ("dofs_motion_vel", p_joint.dofs_motion_vel, variant_joint.dofs_motion_vel),
                             ("dofs_limit", p_joint.dofs_limit, variant_joint.dofs_limit),
+                            ("dofs_stiffness", p_joint.dofs_stiffness, variant_joint.dofs_stiffness),
+                            ("dofs_damping", p_joint.dofs_damping, variant_joint.dofs_damping),
+                            ("dofs_frictionloss", p_joint.dofs_frictionloss, variant_joint.dofs_frictionloss),
+                            ("dofs_armature", p_joint.dofs_armature, variant_joint.dofs_armature),
+                            ("dofs_act_gain", p_joint.dofs_act_gain, variant_joint.dofs_act_gain),
+                            ("dofs_act_bias", p_joint.dofs_act_bias, variant_joint.dofs_act_bias),
+                            ("dofs_force_range", p_joint.dofs_force_range, variant_joint.dofs_force_range),
                         ):
                             if not np.allclose(value, variant_value, atol=gs.EPS, rtol=0.0):
                                 gs.raise_exception(
                                     f"Heterogeneous variant joint '{p_joint.name}' has different '{name}' from the "
-                                    "primary. Joint-local anchors, motion axes and limits must match across variants."
+                                    "primary. Every environment simulates the joints of the primary, so their "
+                                    "anchors, motion axes, limits and dynamics must match across variants."
                                 )
 
                 # Post-process each link's geoms. The COM/principal-axis anchoring of the floating base is deferred
@@ -543,6 +557,7 @@ class KinematicEntityDescription(EntityDescription):
                         default_armature=morph.default_armature,
                     )
                 )
+                root_pos, root_quat = v_l_infos[0]["pos"], v_l_infos[0]["quat"]
 
             elif isinstance(morph, (gs.morphs.Mesh, gs.morphs.Primitive)):
                 if isinstance(morph, gs.morphs.Mesh):
@@ -581,16 +596,32 @@ class KinematicEntityDescription(EntityDescription):
                         links=[variant_link],
                     )
                 )
+                root_pos, root_quat = np.array(morph.pos), np.array(morph.quat)
             else:
                 gs.raise_exception(
                     f"Heterogeneous morphs only support URDF, MJCF, Primitive, and Mesh, got: {type(morph).__name__}."
                 )
 
+            # The root frame of the primary is the one simulated in every environment (see
+            # 'KinematicVariantLinkDescription'), so a root without a free joint must stand there in every variant.
+            if not is_root_free:
+                root_pos, root_quat = gu.transform_pos_quat_by_trans_quat(offset_pos, offset_quat, root_pos, root_quat)
+                primary_pos, primary_quat = self.links[0].pos, self.links[0].quat
+                if not np.allclose(root_pos, primary_pos, atol=gs.EPS, rtol=0.0) or not (
+                    np.allclose(root_quat, primary_quat, atol=gs.EPS, rtol=0.0)
+                    or np.allclose(root_quat, -primary_quat, atol=gs.EPS, rtol=0.0)
+                ):
+                    gs.raise_exception(
+                        "Heterogeneous variant root pose differs from the primary's. A root without a free joint "
+                        "stands at the pose of the primary in every environment."
+                    )
+
     def _describe_variant_link(self, i_link, v_l_info, cg_infos, vg_infos, morph, inertial_info):
         """Describe the geoms one variant gives one link. A kinematic entity only ever draws them."""
+        is_root = self.links[i_link].parent_idx == -1
         return KinematicVariantLinkDescription(
-            pos=self.links[i_link].pos if v_l_info is None else v_l_info["pos"],
-            quat=self.links[i_link].quat if v_l_info is None else v_l_info["quat"],
+            pos=self.links[i_link].pos if is_root else v_l_info["pos"],
+            quat=self.links[i_link].quat if is_root else v_l_info["quat"],
             vgeoms=[description_from_info(RigidVisGeomDescription, vg_info) for vg_info in vg_infos],
         )
 
@@ -1131,9 +1162,10 @@ class KinematicEntityDescription(EntityDescription):
             # and principal axes. It re-expresses the variant geoms, so the geometry keeps its world pose, and folds
             # into the variant offset and init_qpos.
             for i_v in range(len(resolution.links_inertial_info[i_root])):
+                variant_links = links if i_v == 0 else variants[i_v].links
                 pose_in_root = {i_root: (gu.zero_pos(), gu.identity_quat())}
                 for i_l in subtree[1:]:
-                    desc = links[i_l] if i_v == 0 else variants[i_v].links[i_l]
+                    desc = variant_links[i_l]
                     pose_in_root[i_l] = gu.transform_pos_quat_by_trans_quat(
                         desc.pos, desc.quat, *pose_in_root[links[i_l].parent_idx]
                     )
@@ -1190,7 +1222,7 @@ class KinematicEntityDescription(EntityDescription):
                     pos, quat = gu.inv_transform_pos_quat_by_trans_quat(link_pos, link_quat, com_root, principal_quat)
                     pos, quat = gu.inv_transform_pos_quat_by_trans_quat(pos, quat, link_pos, link_quat)
                     alignment_inv_in_link[i_l] = (pos, quat)
-                    link_desc = links[i_l] if i_v == 0 else variants[i_v].links[i_l]
+                    link_desc = variant_links[i_l]
                     geoms = list(link_desc.vgeoms)
                     if isinstance(link_desc, (RigidLinkDescription, RigidVariantLinkDescription)):
                         geoms += link_desc.geoms
@@ -1203,7 +1235,7 @@ class KinematicEntityDescription(EntityDescription):
                 # '_init_tree_fields').
                 if isinstance(root, RigidLinkDescription):
                     for i_l in subtree:
-                        desc = links[i_l] if i_v == 0 else variants[i_v].links[i_l]
+                        desc = variant_links[i_l]
                         desc.inertial_pos, desc.inertial_quat = gu.transform_pos_quat_by_trans_quat(
                             desc.inertial_pos, desc.inertial_quat, *alignment_inv_in_link[i_l]
                         )
@@ -1508,9 +1540,10 @@ class RigidEntityDescription(KinematicEntityDescription):
         inertial = finalize_inertial(
             mass, com, quat, inertia, *inertial_info.hint, clamp_min_mass=not is_link_fixed(self.links, i_link)
         )
+        is_root = self.links[i_link].parent_idx == -1
         return RigidVariantLinkDescription(
-            pos=self.links[i_link].pos if v_l_info is None else v_l_info["pos"],
-            quat=self.links[i_link].quat if v_l_info is None else v_l_info["quat"],
+            pos=self.links[i_link].pos if is_root else v_l_info["pos"],
+            quat=self.links[i_link].quat if is_root else v_l_info["quat"],
             vgeoms=[description_from_info(RigidVisGeomDescription, vg_info) for vg_info in vg_infos],
             mass=inertial.mass,
             inertial_pos=inertial.com,

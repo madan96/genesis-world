@@ -51,6 +51,8 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
         self._hybrid_bindings = []
         self.is_moving_window = options.grid_mode == "moving_window"
         self.regions = None
+        self.grid_contact = None
+        self.grid_seam_mask = None
 
         self._n_vvert_supports = self.scene.options.vis.n_support_neighbors
 
@@ -150,16 +152,21 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
             mass=gs.qd_float,  # mass
             vel_in=gs.qd_vec3,  # input momentum/velocity
             vel_out=gs.qd_vec3,  # output momentum/velocity
-            mass_gradient=gs.qd_vec3,
-            friction_mass=gs.qd_float,
         )
         # Grid is only ever indexed at [f] (never [f+1]) in p2g/g2p/reset/coupler, so substeps_local frames are enough.
         # Particles still need substeps_local + 1 because g2p writes the next-frame state at [f+1].
-        self.grid = grid_cell_state.field(
-            shape=(self._sim.substeps_local, *self._grid_res, self.regions.n_regions, self._B),
-            needs_grad=True,
-            layout=qd.Layout.SOA,
-        )
+        grid_shape = (self._sim.substeps_local, *self._grid_res, self.regions.n_regions, self._B)
+        self.grid = grid_cell_state.field(shape=grid_shape, needs_grad=self._sim.requires_grad, layout=qd.Layout.SOA)
+        # Per-node inputs of the contact resolution between regions (see kernel_contact_grid_fields): the gradient of
+        # the region's mass and its friction-weighted mass. Only a multi-region grid resolves such contacts, so every
+        # access sits under a static 'n_regions > 1' gate and a single-region grid allocates nothing.
+        if self.regions.n_regions > 1:
+            grid_contact_state = qd.types.struct(mass_gradient=gs.qd_vec3, friction_mass=gs.qd_float)
+            self.grid_contact = grid_contact_state.field(shape=grid_shape, layout=qd.Layout.SOA)
+        # Union of the seam masks of the particles each region projects onto the node (see GridRegions). Only a positive
+        # mass contribution marks a node, so a node without mass holds no seam bits and reset_dirty_cells skips it.
+        if self.regions.has_seams:
+            self.grid_seam_mask = qd.field(gs.qd_int, shape=grid_shape)
 
         # Sparse-reset bookkeeping for forward-only mode. A single global dirty list captures unique cells touched by
         # p2g across all envs in the current substep; reset_dirty_cells zeroes those cells across all envs immediately
@@ -175,6 +182,14 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
         self.particles_lower = qd.field(gs.qd_vec3, shape=self._B)
         self.particles_upper = qd.field(gs.qd_vec3, shape=self._B)
         self.active_particles = qd.field(gs.qd_int, shape=self._B)
+        # Partial occupancy bounds of kernel_particle_bounds. A chunk count proportional to the square root of the
+        # particle count keeps both of its serial loops short. The factor two shifts work from the per-chunk loop, which
+        # reads strided particle state, to the per-environment loop, whose contiguous partials cost less per item.
+        self._n_bounds_chunks = int(np.ceil(2.0 * np.sqrt(self._n_particles)))
+        particles_bounds_state = qd.types.struct(lower=gs.qd_vec3, upper=gs.qd_vec3, n_active=gs.qd_int)
+        self.particles_bounds_chunks = particles_bounds_state.field(
+            shape=(self._n_bounds_chunks, self._B), layout=qd.Layout.SOA
+        )
         self.active_cell_count = qd.field(gs.qd_int, shape=self._B)
         # Sticky errors: bit 0 marks insufficient stencil support; bit 1 marks non-finite active particle positions.
         self.window_errno = qd.field(gs.qd_int, shape=self._B)
@@ -228,7 +243,8 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
 
     def reset_grad(self):
         self.particles.grad.fill(0.0)
-        self.grid.grad.fill(0.0)
+        if self._sim.requires_grad:
+            self.grid.grad.fill(0.0)
 
         for entity in self._entities:
             entity.reset_grad()
@@ -336,6 +352,16 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
             ("regions.is_collision_enabled", self.regions.is_collision_enabled, array_class.DataKind.INFO),
         ):
             yield from array_class.iter_data(value, name, kind)
+        for name, value, kind in (
+            ("particles_bounds_chunks", self.particles_bounds_chunks, array_class.DataKind.SCRATCH),
+            ("grid_contact", self.grid_contact, array_class.DataKind.SCRATCH),
+            ("grid_seam_mask", self.grid_seam_mask, array_class.DataKind.SCRATCH),
+            ("regions.seam_bit", self.regions.seam_bit, array_class.DataKind.CONSTANT),
+            ("regions.particles_seam_mask", self.regions.particles_seam_mask, array_class.DataKind.CONSTANT),
+        ):
+            # Multi-region and seam arrays exist only for grids that use them (see init_grid_fields and GridRegions).
+            if value is not None:
+                yield from array_class.iter_data(value, name, kind)
         for i_binding, binding in enumerate(self._hybrid_bindings):
             for name, value in (
                 ("links_idx", binding.bind_links_idx),
@@ -346,7 +372,7 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
                 ("damping_ratio", binding.damping_ratio),
                 ("mobility_bound", binding.mobility_bound),
                 ("link_soft_mass", binding.link_soft_mass),
-                ("link_weighted_radius", binding.link_weighted_radius),
+                ("link_weighted_lever", binding.link_weighted_lever),
             ):
                 yield from array_class.iter_data(value, f"bindings.{i_binding}.{name}", array_class.DataKind.STATE)
 
@@ -526,6 +552,10 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
                 fx = self.particles[f, i_p, i_b].pos * self._inv_dx - base.cast(gs.qd_float)
                 w = [0.5 * (1.5 - fx) ** 2, 0.75 - (fx - 1) ** 2, 0.5 * (fx - 0.5) ** 2]
                 dw = [(fx - 1.5) * self._inv_dx, -2.0 * (fx - 1.0) * self._inv_dx, (fx - 0.5) * self._inv_dx]
+                # Loaded once for the whole stencil, and predeclared outside the static branch for the same reason as J.
+                seam_mask = gs.qd_int(0)
+                if qd.static(self.regions.has_seams):
+                    seam_mask = self.regions.particles_seam_mask[i_p]
                 for offset in qd.static(qd.grouped(self.stencil_range())):
                     dpos = (offset.cast(gs.qd_float) - fx) * self._dx
                     weight = gs.qd_float(1.0)
@@ -560,17 +590,25 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
                         self.grid[f, cell_ijk, i_r, i_b].vel_in += weight * (
                             self.particles_info[i_p].mass * self.particles[f, i_p, i_b].vel + affine @ dpos
                         )
-                        gradient = qd.Vector.zero(gs.qd_float, 3)
-                        for i_axis in qd.static(range(3)):
-                            gradient[i_axis] = dw[offset[i_axis]][i_axis]
-                            for j_axis in qd.static(range(3)):
-                                if j_axis != i_axis:
-                                    gradient[i_axis] *= w[offset[j_axis]][j_axis]
-                        self.grid[f, cell_ijk, i_r, i_b].mass_gradient -= gradient * self.particles_info[i_p].mass
                         mass_contrib = weight * self.particles_info[i_p].mass
                         if qd.static(self.regions.n_regions > 1):
+                            gradient = qd.Vector.zero(gs.qd_float, 3)
+                            for i_axis in qd.static(range(3)):
+                                gradient[i_axis] = dw[offset[i_axis]][i_axis]
+                                for j_axis in qd.static(range(3)):
+                                    if j_axis != i_axis:
+                                        gradient[i_axis] *= w[offset[j_axis]][j_axis]
                             i_m = self.particles_info.material_idx[i_p]
-                            self.grid[f, cell_ijk, i_r, i_b].friction_mass += mass_contrib * self.material_friction[i_m]
+                            self.grid_contact[f, cell_ijk, i_r, i_b].mass_gradient -= (
+                                gradient * self.particles_info[i_p].mass
+                            )
+                            self.grid_contact[f, cell_ijk, i_r, i_b].friction_mass += (
+                                mass_contrib * self.material_friction[i_m]
+                            )
+                            # Only nodes that receive mass are marked (see grid_seam_mask in init_grid_fields).
+                            if qd.static(self.regions.has_seams):
+                                if seam_mask != 0 and mass_contrib > 0.0:
+                                    qd.atomic_or(self.grid_seam_mask[f, cell_ijk, i_r, i_b], seam_mask)
                         prev_mass = qd.atomic_add(self.grid[f, cell_ijk, i_r, i_b].mass, mass_contrib)
                         # Sparse-reset bookkeeping runs forward-only: backward mode composes p2g through autodiff where
                         # these atomics are meaningless. Per-env first-writer (prev_mass == 0) tries to claim the cell
@@ -839,14 +877,10 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
             self.grid[f, i, j, k, i_r, i_b].vel_in = qd.Vector.zero(gs.qd_float, 3)
             self.grid[f, i, j, k, i_r, i_b].mass = gs.qd_float(0.0)
             self.grid[f, i, j, k, i_r, i_b].vel_out = qd.Vector.zero(gs.qd_float, 3)
-            self.grid[f, i, j, k, i_r, i_b].mass_gradient = qd.Vector.zero(gs.qd_float, 3)
-            self.grid[f, i, j, k, i_r, i_b].friction_mass = gs.qd_float(0.0)
 
             self.grid.grad[f, i, j, k, i_r, i_b].vel_in = qd.Vector.zero(gs.qd_float, 3)
             self.grid.grad[f, i, j, k, i_r, i_b].mass = gs.qd_float(0.0)
             self.grid.grad[f, i, j, k, i_r, i_b].vel_out = qd.Vector.zero(gs.qd_float, 3)
-            self.grid.grad[f, i, j, k, i_r, i_b].mass_gradient = qd.Vector.zero(gs.qd_float, 3)
-            self.grid.grad[f, i, j, k, i_r, i_b].friction_mass = gs.qd_float(0.0)
 
     @qd.kernel
     def reset_dirty_cells(self, f: qd.i32):
@@ -856,12 +890,22 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
             remaining = flat // self._grid_res[2]
             j = remaining % self._grid_res[1]
             i = remaining // self._grid_res[1]
+            # The occupied region nodes of the substep are counted here, where every dirty node is visited anyway.
+            n_occupied = 0
             for i_r in range(self.regions.n_regions):
+                if self.grid[f, i, j, k, i_r, i_b].mass > 0.0:
+                    n_occupied += 1
+                    # Only occupied nodes hold seam bits (see grid_seam_mask in init_grid_fields).
+                    if qd.static(self.regions.has_seams):
+                        self.grid_seam_mask[f, i, j, k, i_r, i_b] = 0
                 self.grid[f, i, j, k, i_r, i_b].mass = 0.0
                 self.grid[f, i, j, k, i_r, i_b].vel_in = 0.0
                 self.grid[f, i, j, k, i_r, i_b].vel_out = 0.0
-                self.grid[f, i, j, k, i_r, i_b].mass_gradient = 0.0
-                self.grid[f, i, j, k, i_r, i_b].friction_mass = 0.0
+                if qd.static(self.regions.n_regions > 1):
+                    self.grid_contact[f, i, j, k, i_r, i_b].mass_gradient = 0.0
+                    self.grid_contact[f, i, j, k, i_r, i_b].friction_mass = 0.0
+            if n_occupied > 0:
+                self.active_cell_count[i_b] += n_occupied
             if i_b == 0:
                 self.grid_dirty_flag[i, j, k] = 0
 

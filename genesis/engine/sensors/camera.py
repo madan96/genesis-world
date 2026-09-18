@@ -211,6 +211,11 @@ class BatchRendererCameraSharedMetadata(KinematicSensorMetadataMixin, SharedSens
         self.visualizer_wrapper = None
 
 
+CameraSharedMetadata = (
+    RasterizerCameraSharedMetadata | RaytracerCameraSharedMetadata | BatchRendererCameraSharedMetadata
+)
+
+
 # ========================== Base Camera Sensor ==========================
 
 
@@ -264,7 +269,7 @@ class BaseCameraSensor(KinematicSensorMixin, Sensor[OptionsT, None, SharedSensor
         pass
 
     @classmethod
-    def reset(cls, shared_metadata: SharedSensorMetadata, shared_ground_truth_cache: torch.Tensor, envs_idx):
+    def reset(cls, shared_metadata: CameraSharedMetadata, shared_ground_truth_cache: torch.Tensor, envs_idx):
         super().reset(shared_metadata, shared_ground_truth_cache, envs_idx)
         # Reset can restore a different state at the last rendered timestep, so force the next read to rerender.
         # FIXME: the frame cache keys on a single timestep for the whole batch, so a partial-env reset invalidates
@@ -272,7 +277,7 @@ class BaseCameraSensor(KinematicSensorMixin, Sensor[OptionsT, None, SharedSensor
         shared_metadata.last_render_timestep = -1
 
     @classmethod
-    def state_restored(cls, shared_metadata: SharedSensorMetadata) -> None:
+    def state_restored(cls, shared_metadata: CameraSharedMetadata) -> None:
         super().state_restored(shared_metadata)
         # Restoring a snapshot installs a different state at the timestep the cached frame was rendered for, so the
         # next read must rerender instead of serving that frame. The frame cache holds no restorable tensor itself.
@@ -460,13 +465,13 @@ class RasterizerCameraSensor(
         self._shared_metadata.image_cache[self._idx] = torch.zeros((_B, h, w, 3), dtype=torch.uint8, device=gs.device)
 
     @classmethod
-    def reset(cls, shared_metadata: SharedSensorMetadata, shared_ground_truth_cache: torch.Tensor, envs_idx):
+    def reset(cls, shared_metadata: RasterizerCameraSharedMetadata, shared_ground_truth_cache: torch.Tensor, envs_idx):
         super().reset(shared_metadata, shared_ground_truth_cache, envs_idx)
         # The context syncs with the simulation once per step, so a reset at the last synced step must clear that
         shared_metadata.context.reset()
 
     @classmethod
-    def state_restored(cls, shared_metadata: SharedSensorMetadata) -> None:
+    def state_restored(cls, shared_metadata: RasterizerCameraSharedMetadata) -> None:
         super().state_restored(shared_metadata)
         # The context syncs with the simulation once per step, so a restore at the last synced step must clear that.
         shared_metadata.context.reset()

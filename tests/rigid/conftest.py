@@ -39,6 +39,17 @@ def independent_scalar_joints():
 
 
 @pytest.fixture
+def light_hinge():
+    mjcf = ET.Element("mujoco")
+    worldbody = ET.SubElement(mjcf, "worldbody")
+    body = ET.SubElement(worldbody, "body", name="hand", pos="0 2 1")
+    ET.SubElement(body, "joint", name="wrist", type="hinge", axis="0 0 1", armature="0")
+    # Inertia about the joint axis is 2/5 * 0.14 * 0.05^2 = 1.4e-4, the order of a hand about the wrist.
+    ET.SubElement(body, "geom", type="sphere", size="0.05", mass="0.14")
+    return ET.tostring(mjcf, encoding="unicode")
+
+
+@pytest.fixture
 def articulated_variants():
     models = []
     for length, angle in ((0.2, 0.0), (0.4, 90.0)):
@@ -75,9 +86,21 @@ def inconsistent_articulated_variants(articulated_variants):
         ("dofs_motion_ang", {"axis": "1 0 0"}),
         ("pos", {"pos": "0.1 0 0"}),
         ("dofs_limit", {"limited": "true", "range": "-30 30"}),
+        ("dofs_stiffness", {"stiffness": "3"}),
+        ("dofs_damping", {"damping": "5"}),
+        ("dofs_frictionloss", {"frictionloss": "0.5"}),
+        ("dofs_armature", {"armature": "0.2"}),
+        ("dofs_force_range", {"actuatorfrclimited": "true", "actuatorfrcrange": "-1 1"}),
     ):
         mjcf = ET.fromstring(articulated_variants[1])
         mjcf.find("worldbody/body/body/joint").attrib.update(values)
+        models.append((name, ET.tostring(mjcf, encoding="unicode")))
+    for name, tag, values in (
+        ("dofs_act_gain", "motor", {"joint": "hinge", "gear": "2"}),
+        ("dofs_act_bias", "general", {"joint": "hinge", "gainprm": "0", "biastype": "affine", "biasprm": "0 -5 0"}),
+    ):
+        mjcf = ET.fromstring(articulated_variants[1])
+        ET.SubElement(ET.SubElement(mjcf, "actuator"), tag, values)
         models.append((name, ET.tostring(mjcf, encoding="unicode")))
     mjcf = ET.fromstring(articulated_variants[1])
     base = mjcf.find("worldbody/body")
