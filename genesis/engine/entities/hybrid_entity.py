@@ -1,4 +1,5 @@
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -10,8 +11,15 @@ import quadrants as qd
 import genesis as gs
 import genesis.utils.geom as gu
 import genesis.utils.urdf as uu
-from genesis.engine.hybrid_binding import HybridBinding, HybridBindingDiagnostics, HybridMassBreakdown
+from genesis.engine.hybrid_binding import (
+    HybridBinding,
+    HybridBindingDescription,
+    HybridBindingDiagnostics,
+    HybridMassBreakdown,
+)
 from genesis.ext.urdfpy.urdf import URDF
+from genesis.options.morphs import Morph
+from genesis.options.surfaces import Surface
 from genesis.utils import array_class
 from genesis.utils.hybrid import (
     check_graph,
@@ -24,8 +32,18 @@ from genesis.utils.hybrid import (
 )
 from genesis.utils.mesh import load_mesh
 
-from .base_entity import Entity
+from .base_entity import Entity, EntityDescription
 from .mpm_entity import MPMEntity
+
+
+@dataclass
+class HybridEntityDescription(EntityDescription):
+    """Continuous skin wrapper and its resolved binding to existing rigid and particle entities."""
+
+    morph: Morph
+    surface: Surface
+    name: str
+    binding: HybridBindingDescription
 
 
 @qd.data_oriented
@@ -53,11 +71,16 @@ class HybridEntity(Entity):
         The surface properties applied to the soft part of the entity.
     """
 
-    def __init__(self, idx, scene, material, morph, surface, name: str | None = None):
+    def __init__(self, idx, scene, material, morph, surface, name: str | None = None, desc=None):
+        if desc is not None:
+            material, morph, surface, name = desc.material, desc.morph, desc.surface, desc.name
         super().__init__(idx, scene, morph, None, material, surface, name=name)
         self._skin_binding = None
+        self._desc = None
         if material.is_explicit:
-            self._skin_binding = HybridBinding(self, scene, material, morph, surface)
+            self._skin_binding = HybridBinding(
+                self, scene, material, morph, surface, None if desc is None else desc.binding
+            )
             self._part_rigid = self._skin_binding.part_rigid
             self._part_soft = self._skin_binding.part_soft
             self._solver_rigid = self._part_rigid.solver
@@ -65,6 +88,7 @@ class HybridEntity(Entity):
             self._material_rigid = self._part_rigid.material
             self._material_soft = self._part_soft.material
             self._idx = scene.sim.n_entities
+            self._desc = HybridEntityDescription(material, morph, surface, self.name, self._skin_binding.desc)
             return
 
         material_rigid = material.material_rigid
@@ -469,6 +493,10 @@ class HybridEntity(Entity):
     # ------------------------------------------------------------------------------------
     # ----------------------------------- properties -------------------------------------
     # ------------------------------------------------------------------------------------
+
+    @property
+    def desc(self) -> HybridEntityDescription | None:
+        return self._desc
 
     @property
     def is_built(self):

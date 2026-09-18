@@ -304,12 +304,61 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
     # ------------------------------------------------------------------------------------
 
     @property
+    def data(self):
+        """Enumerate forward MPM state and resolved material, region and attachment arrays for native checkpoints."""
+        if self.sim.requires_grad or self.enable_CPIC or self._constraints_initialized:
+            gs.raise_exception(
+                "MPM checkpoints require forward simulation with CPIC and particle constraints disabled."
+            )
+        for name, value, kind in (
+            ("particles", self.particles, array_class.DataKind.STATE),
+            ("particles_ng", self.particles_ng, array_class.DataKind.STATE),
+            ("particles_info", self.particles_info, array_class.DataKind.INFO),
+            ("vverts_info", self.vverts_info, array_class.DataKind.INFO),
+            ("material_friction", self.material_friction, array_class.DataKind.INFO),
+            ("gravity", self._gravity, array_class.DataKind.STATE),
+            ("grid_origin", self.grid_origin, array_class.DataKind.STATE),
+            ("particles_lower", self.particles_lower, array_class.DataKind.STATE),
+            ("particles_upper", self.particles_upper, array_class.DataKind.STATE),
+            ("active_particles", self.active_particles, array_class.DataKind.STATE),
+            ("active_cell_count", self.active_cell_count, array_class.DataKind.STATE),
+            ("window_errno", self.window_errno, array_class.DataKind.STATE),
+            ("grid_dirty_flag", self.grid_dirty_flag, array_class.DataKind.STATE),
+            ("grid_dirty_list", self.grid_dirty_list, array_class.DataKind.STATE),
+            ("grid_dirty_count", self.grid_dirty_count, array_class.DataKind.STATE),
+            ("grid", self.grid, array_class.DataKind.SCRATCH),
+            ("particles_render", self.particles_render, array_class.DataKind.SCRATCH),
+            ("vverts_render", self.vverts_render, array_class.DataKind.SCRATCH),
+            ("regions.entity_idx", self.regions.entity_idx, array_class.DataKind.INFO),
+            ("regions.region_idx", self.regions.region_idx, array_class.DataKind.INFO),
+            ("regions.is_surface_contact", self.regions.is_surface_contact, array_class.DataKind.INFO),
+            ("regions.is_bonded", self.regions.is_bonded, array_class.DataKind.INFO),
+            ("regions.is_collision_enabled", self.regions.is_collision_enabled, array_class.DataKind.INFO),
+        ):
+            yield from array_class.iter_data(value, name, kind)
+        for i_binding, binding in enumerate(self._hybrid_bindings):
+            for name, value in (
+                ("links_idx", binding.bind_links_idx),
+                ("weights", binding.bind_weights),
+                ("rest_local_pos", binding.bind_rest_local_pos),
+                ("active_count", binding.bind_active_count),
+                ("omega", binding.omega),
+                ("damping_ratio", binding.damping_ratio),
+                ("mobility_bound", binding.mobility_bound),
+                ("link_soft_mass", binding.link_soft_mass),
+                ("link_weighted_radius", binding.link_weighted_radius),
+            ):
+                yield from array_class.iter_data(value, f"bindings.{i_binding}.{name}", array_class.DataKind.STATE)
+
+    @property
     def is_active(self):
         return self.n_particles > 0
 
     def add_entity(
         self, idx, material, morph, surface, visualize_contact=False, name: str | None = None, desc=None
     ) -> "MPMEntity":
+        if desc is not None:
+            material, morph, surface, name = desc.material, desc.morph, desc.surface, desc.name
         self.add_material(material)
 
         # create entity
@@ -325,6 +374,7 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
             vvert_start=self.n_vverts,
             vface_start=self.n_vfaces,
             name=name,
+            desc=desc,
         )
         self._entities.append(entity)
 

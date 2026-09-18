@@ -26,6 +26,7 @@ from .solvers import (
 )
 from .solvers.base_solver import GravityMixin, TimeBasedMixin
 from .states.cache import QueriedStates
+from .states.checkpoint import random_state, state_tensors
 from .states.contacts import ContactObservationState
 from .states.solvers import SimState, SimulatorCheckpoint
 
@@ -138,7 +139,7 @@ class Simulator(RBC):
             gs.raise_exception("'visualize_contact' only applies to rigid entities.")
         if isinstance(material, gs.materials.Hybrid):
             # Note that adding to solver is handled in the hybrid entity
-            entity = HybridEntity(self.n_entities, self.scene, material, morph, surface, name=name)
+            entity = HybridEntity(self.n_entities, self.scene, material, morph, surface, name=name, desc=desc)
             entity._idx = self.n_entities
         else:
             # Several solvers may declare a class the material belongs to, since 'Rigid' derives from 'Kinematic'. The
@@ -267,12 +268,7 @@ class Simulator(RBC):
             binding.reset(self.scene._sanitize_envs_idx(envs_idx))
 
         if contact_state is not None:
-            if contact_state.rigid is not None:
-                self.rigid_solver.collider.set_observation_state(contact_state.rigid, envs_idx)
-            if isinstance(self._coupler, LegacyCoupler) and contact_state.mpm is not None:
-                self._coupler.contact_telemetry.set_state(contact_state.mpm, envs_idx)
-            for binding, binding_state in zip(self.mpm_solver._hybrid_bindings, contact_state.attachments):
-                binding.set_observation_state(binding_state, envs_idx)
+            self.set_contact_state(contact_state, envs_idx)
 
         # TODO: keeping as is for now
         self.reset_grad()
@@ -306,15 +302,27 @@ class Simulator(RBC):
         return SimulatorCheckpoint(
             steps=self._steps.clone(),
             solvers={type(solver).__name__: solver.__getstate__() for solver in self._active_solvers},
+            auxiliary=self.checkpoint_arrays(),
         )
+
+    def checkpoint_arrays(self) -> dict[str, torch.Tensor]:
+        """Capture clocks, observations, sensor electronics, pending particle commands and PyTorch random streams."""
+        arrays = dict(state_tensors(self.get_contact_state(compact=False, include_rigid=False), "contacts"))
+        arrays.update(state_tensors(self._sensor_manager.get_state(), "sensors"))
+        arrays.update((f"rng.{key}", value) for key, value in random_state().items())
+        arrays["substep"] = torch.tensor([self._cur_substep_global], dtype=torch.int64, device=gs.device)
+        for entity in self.mpm_solver.entities:
+            arrays.update((f"inputs.{entity.idx}.{key}", value) for key, value in entity.checkpoint_inputs().items())
+        return arrays
 
     def __setstate__(self, state: SimulatorCheckpoint) -> None:
         """Put the built simulation back in a state '__getstate__' read.
 
         Everything around the state restarts as under a reset.
 
-        The clock of each environment comes back as recorded, since simulated time is state. The tape cursor, the
-        gradients, the coupler and the sensors are restarted (see 'reset'): they describe the run that led here.
+        The clock of each environment comes back as recorded. Schema 3 also restores the global substep count,
+        observations, sensor electronics and pending particle inputs. The differentiation tape restarts. PyTorch
+        random streams remain under caller control, with explicit restoration offered by the trajectory loader.
         """
         # The record was checked against every solver by the scene (see 'Scene.__setstate__'). The restart precedes the
         # state, whose gradients it would zero otherwise.
@@ -322,6 +330,19 @@ class Simulator(RBC):
         for solver in self._active_solvers:
             solver.__setstate__(state.solvers[type(solver).__name__])
         self._steps[:] = torch.as_tensor(state.steps, device=gs.device)
+        if state.auxiliary:
+            contacts = self.get_contact_state(compact=False, include_rigid=False)
+            sensors = self._sensor_manager.get_state()
+            for name, target in (*state_tensors(contacts, "contacts"), *state_tensors(sensors, "sensors")):
+                target.copy_(torch.as_tensor(state.auxiliary[name], device=target.device))
+            self.set_contact_state(contacts)
+            self._sensor_manager.set_state(sensors)
+            self._cur_substep_global = int(state.auxiliary["substep"][0])
+            for entity in self.mpm_solver.entities:
+                prefix = f"inputs.{entity.idx}."
+                entity.restore_checkpoint_inputs(
+                    {name[len(prefix) :]: value for name, value in state.auxiliary.items() if name.startswith(prefix)}
+                )
         # Flush the zero-copy writes of fill_data on Metal.
         if gs.use_zerocopy and gs.backend == gs.metal:
             torch.mps.synchronize()
@@ -514,15 +535,26 @@ class Simulator(RBC):
     # --------------------------------------- io -----------------------------------------
     # ------------------------------------------------------------------------------------
 
-    def get_contact_state(self) -> ContactObservationState:
+    def get_contact_state(self, *, compact: bool = True, include_rigid: bool = True) -> ContactObservationState:
         """Capture owned contact observations independently of solver dynamics and sensor electronics."""
         return ContactObservationState(
-            self.rigid_solver.collider.get_observation_state() if self.rigid_solver.is_active else None,
-            self._coupler.contact_telemetry.get_state()
+            self.rigid_solver.collider.get_observation_state()
+            if include_rigid and self.rigid_solver.is_active
+            else None,
+            self._coupler.contact_telemetry.get_state(compact=compact)
             if isinstance(self._coupler, LegacyCoupler) and self._coupler.contact_telemetry is not None
             else None,
             tuple(binding.get_observation_state() for binding in self.mpm_solver._hybrid_bindings),
         )
+
+    def set_contact_state(self, state: ContactObservationState, envs_idx=None) -> None:
+        """Restore owned contact and attachment observations after the solver dynamics have been restored."""
+        if state.rigid is not None:
+            self.rigid_solver.collider.set_observation_state(state.rigid, envs_idx)
+        if isinstance(self._coupler, LegacyCoupler) and state.mpm is not None:
+            self._coupler.contact_telemetry.set_state(state.mpm, envs_idx)
+        for binding, binding_state in zip(self.mpm_solver._hybrid_bindings, state.attachments):
+            binding.set_observation_state(binding_state, envs_idx)
 
     def get_state(self):
         state = SimState(

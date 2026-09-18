@@ -221,6 +221,7 @@ def _classes_by_name(expect) -> dict[str, type]:
     while classes:
         cls = classes.pop()
         by_name[cls.__name__] = cls
+        by_name[f"{cls.__module__}.{cls.__qualname__}"] = cls
         classes.extend(cls.__subclasses__())
     return by_name
 
@@ -394,7 +395,11 @@ def _export_value(value, expect, exported: "Exported"):
         # A class saying how it travels may stand where its base is declared, so the file names which one it is.
         if held is None or _accepted_classes(expect) == (type(value),):
             return held
-        return {"@class": type(value).__name__, "raw": held}
+        cls = type(value)
+        name = cls.__name__
+        if _classes_by_name(expect).get(name) is not cls:
+            name = f"{cls.__module__}.{cls.__qualname__}"
+        return {"@class": name, "raw": held}
     if _has_declared_fields(expect):
         exported.classes.add(type(value))
         given = vars(value)

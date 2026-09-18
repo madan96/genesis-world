@@ -12,9 +12,31 @@ import genesis.utils.geom as gu
 import genesis.utils.mesh as mu
 import genesis.utils.particle as pu
 from genesis.engine.states.cache import QueriedStates
+from genesis.engine.mesh import Mesh
+from genesis.options.morphs import Morph
+from genesis.options.surfaces import Surface
 from genesis.utils.misc import to_gs_tensor, broadcast_tensor
 
-from .base_entity import Entity
+from .base_entity import Entity, EntityDescription
+
+
+@dataclass
+class ParticleEntityDescription(EntityDescription):
+    """Resolved particle geometry, including the sampled rest positions and visual mesh.
+
+    Rest positions use world meters in particle order. Loading uses these samples directly, independently of the
+    source asset, sampler implementation and random generator state.
+    """
+
+    morph: Morph
+    surface: Surface
+    name: str
+    particles: np.ndarray
+    origin: np.ndarray
+    vmesh: Mesh | None
+    vverts: np.ndarray
+    vfaces: np.ndarray
+    mesh_set_group_ids: np.ndarray | None
 
 
 @dataclass(frozen=True)
@@ -78,6 +100,7 @@ class ParticleEntity(Entity):
         vface_start=None,
         need_skinning=True,
         name: str | None = None,
+        desc: ParticleEntityDescription | None = None,
     ):
         super().__init__(idx, scene, morph, solver, material, surface, name=name)
 
@@ -92,8 +115,17 @@ class ParticleEntity(Entity):
             self._vvert_start = -1
             self._vface_start = -1
 
-        # visual mesh
-        if isinstance(self._morph, gs.options.morphs.MeshSet):
+        self.mesh_set_group_ids = None
+        if desc is not None:
+            self._desc = desc
+            self._vmesh = desc.vmesh
+            self._particles = desc.particles.copy()
+            self._vverts = desc.vverts.copy()
+            self._vfaces = desc.vfaces.copy()
+            self.mesh_set_group_ids = desc.mesh_set_group_ids
+            self._n_particles = len(self._particles)
+            self._init_particles_offset = gs.tensor(self._particles) - gs.tensor(desc.origin)
+        elif isinstance(self._morph, gs.options.morphs.MeshSet):
             self._vmesh = gs.Mesh.from_morph_surface(self.morph, self.surface)
             self._surface = self._vmesh[0].surface
 
@@ -108,7 +140,8 @@ class ParticleEntity(Entity):
             surface.update_texture()
             self._vmesh = None
 
-        self.sample()
+        if desc is None:
+            self.sample()
 
         self.init_tgt_vars()
         self.init_ckpt()
@@ -333,6 +366,18 @@ class ParticleEntity(Entity):
         self._particles = np.asarray(particles, dtype=gs.np_float, order="C")
         self._init_particles_offset = gs.tensor(self._particles) - gs.tensor(origin)
         self._n_particles = len(self._particles)
+        self._desc = ParticleEntityDescription(
+            self.material,
+            self.morph,
+            self.surface,
+            self.name,
+            self._particles.copy(),
+            origin,
+            self._vmesh,
+            self._vverts.copy(),
+            self._vfaces.copy(),
+            self.mesh_set_group_ids,
+        )
 
         gs.logger.info(f"Sampled ~~<{self._n_particles:,}>~~ particles.")
 
@@ -354,6 +399,35 @@ class ParticleEntity(Entity):
         Initialize checkpoint storage for simulation state.
         """
         self._ckpt = dict()
+
+    def checkpoint_inputs(self) -> dict[str, torch.Tensor]:
+        """Capture pending commands in fixed-size batch-first arrays for trajectory frames."""
+        arrays = {"active": torch.tensor([self.active], dtype=gs.tc_bool, device=gs.device)}
+        for key in self._tgt_keys:
+            shape = (self.sim._B, self.n_particles)
+            if key in ("pos", "vel"):
+                shape += (3,)
+            elif key == "actu":
+                shape += (self.material.n_groups,)
+            dtype = gs.tc_bool if key == "act" else gs.tc_float
+            values = torch.zeros(shape, dtype=dtype, device=gs.device)
+            mask = torch.zeros(self.sim._B, dtype=gs.tc_bool, device=gs.device)
+            target = self._tgt[key]
+            if target is not None:
+                values[target.envs_idx] = target.values
+                mask[target.envs_idx] = True
+            arrays[f"{key}.values"] = values
+            arrays[f"{key}.mask"] = mask
+        return arrays
+
+    def restore_checkpoint_inputs(self, arrays) -> None:
+        """Restore validated pending commands without dispatching them before the next step."""
+        self.active = bool(arrays["active"][0])
+        for key in self._tgt_keys:
+            mask = torch.as_tensor(arrays[f"{key}.mask"], device=gs.device)
+            envs_idx = mask.nonzero()[:, 0].to(dtype=gs.tc_int)
+            values = torch.as_tensor(arrays[f"{key}.values"], device=gs.device)[mask].contiguous()
+            self._tgt[key] = ParticleTarget(to_gs_tensor(values).clone(), envs_idx) if len(envs_idx) else None
 
     def save_ckpt(self, ckpt_name):
         """

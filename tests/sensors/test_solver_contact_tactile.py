@@ -9,6 +9,83 @@ from ..utils.assertions import assert_allclose, assert_equal
 
 
 @pytest.mark.required
+@pytest.mark.precision("32")
+@pytest.mark.parametrize("n_envs", [0, 2])
+def test_solver_taxel_many_contact_reduction(n_envs, show_viewer):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=0.002,
+            substeps=10,
+            gravity=(0, 0, 0),
+        ),
+        mpm_options=gs.options.MPMOptions(
+            lower_bound=(-0.25, -0.25, -0.25),
+            upper_bound=(0.375, 0.375, 0.375),
+            grid_density=64,
+            particle_size=0.0078125,
+        ),
+        coupler_options=gs.options.LegacyCouplerOptions(
+            enable_contact_telemetry=True,
+            contact_buffer_capacity=16384,
+        ),
+        show_viewer=show_viewer,
+    )
+    soft = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.125, 0.0625, 0.01),
+            size=(0.125, 0.125, 0.03125),
+        ),
+        material=gs.materials.MPM.Elastic(
+            E=1000,
+            sampler="regular",
+        ),
+        surface=gs.surfaces.Default(
+            vis_mode="particle",
+        ),
+    )
+    floor = scene.add_entity(
+        morph=gs.morphs.Plane(),
+        material=gs.materials.Rigid(
+            coup_friction=0,
+        ),
+    )
+    points = ((0.05, -0.05, 0), (0.05, 0.2, 0), (0.3, -0.05, 0), (0.3, 0.2, 0))
+    sensor = scene.add_sensor(
+        gs.sensors.SolverContactTaxel(
+            entity_idx=floor.idx,
+            probe_local_pos=points,
+            probe_local_normal=(0, 0, 1),
+            probe_radius=1.0,
+            frame="world",
+        ),
+    )
+    scene.build(n_envs=n_envs)
+    soft.set_particles_vel((0, 0, -1))
+    scene.step()
+
+    rows = scene.get_contact_contributions(source="hybrid")
+    assert rows.is_complete.all()
+    assert (rows.count > 1000).all()
+    reading = sensor.read_ground_truth()
+    force = reading.force.double().reshape(max(n_envs, 1), 4, 3)
+    couple = reading.couple.double().reshape_as(force)
+    positions = torch.tensor(points, dtype=torch.float64, device=gs.device)[None]
+    # A float64 reference isolates the float32 accumulation error in the observed forces and moments.
+    reference_force = rows.force.to(device="cpu", dtype=torch.float64)
+    reference_position = rows.position.to(device="cpu", dtype=torch.float64)
+    assert_allclose(force.sum(dim=1), reference_force.sum(dim=1), atol=1e-5, rtol=1e-6)
+    wrench = floor.get_links_contact_wrench(source="hybrid")
+    assert_allclose(force.sum(dim=1), wrench.force[:, 0], atol=1e-5, rtol=1e-6)
+    assert_allclose(
+        (positions.cross(force, dim=-1) + couple).sum(dim=1),
+        reference_position.cross(reference_force, dim=-1).sum(dim=1),
+        atol=1e-5,
+        rtol=1e-6,
+    )
+    assert_allclose((positions.cross(force, dim=-1) + couple).sum(dim=1), wrench.torque[:, 0], atol=1e-5, rtol=1e-6)
+
+
+@pytest.mark.required
 @pytest.mark.parametrize("n_envs", [0, 2])
 def test_solver_taxel_rigid_wrench_frames_and_support(n_envs, show_viewer):
     scene = gs.Scene(

@@ -255,8 +255,7 @@ def test_export_and_load_rigid(
             pos=(80.0, 80.0, 1.0),
         ),
     )
-    # A sensor and a recorder observe the scene rather than taking part in it, and a file holds no code to run.
-    # All three are written without.
+    # Sensor options travel with the scene. Recorders and callbacks are owned by the application.
     scene.add_sensor(
         gs.sensors.IMU(
             entity_idx=box.idx,
@@ -286,10 +285,9 @@ def test_export_and_load_rigid(
     caplog.clear()
     with caplog.at_level("WARNING"):
         scene.export(exported)
-    # A sensor and vertices written at runtime take no part in the simulation. The file is written without them,
-    # and the export names each rather than rejecting.
+    # Runtime visual overrides and application callbacks are reported when exporting scene descriptions.
     left_out = " ".join(record.getMessage() for record in caplog.records)
-    assert "IMUSensor" in left_out
+    assert "IMUSensor" not in left_out
     assert "normal_texture" in left_out
     assert "CSVFileWriter" not in left_out
     assert "pre_step_callback" in left_out
@@ -305,6 +303,7 @@ def test_export_and_load_rigid(
     Path(xml_path).unlink()
 
     restored = gs.Scene.load(exported)
+    assert len(restored.entities[box.idx].sensors) == 1
     assert not restored.is_built
     restored.build(n_envs=n_envs)
     assert restored.n_envs == scene.n_envs
@@ -560,12 +559,12 @@ def test_load_rejects_damaged_file(checkpoint_scene, tmp_path):
 @pytest.mark.required
 def test_export_rejects_unsupported_physics(checkpoint_scene, tmp_path):
     # A scene holding what alters the simulation is rejected by name, since a file leaving it out would restore
-    # other physics. No description carries a particle entity either.
+    # other physics.
     checkpoint_scene.add_entity(
         morph=gs.morphs.Box(pos=(0.5, 0.5, 0.8), size=(0.1, 0.1, 0.1)), material=gs.materials.MPM.Elastic()
     )
     checkpoint_scene.add_force_field(gs.force_fields.Wind(direction=(1.0, 0.0, 0.0)))
-    with pytest.raises(gs.GenesisException, match="1 MPMEntity, 1 Wind cannot be exported"):
+    with pytest.raises(gs.GenesisException, match="1 Wind cannot be exported"):
         checkpoint_scene.export(tmp_path / f"wind{SCENE_FORMAT}")
 
 
@@ -592,7 +591,7 @@ def test_pickle_resume(n_envs, requires_grad, checkpoint_scene, tmp_path, show_v
     box.set_coup_friction_scale(((0.25,), (0.75,)) if n_envs else 0.25)
     read_friction_scale = box.get_coup_friction_scale()
     checkpoint = scene.__getstate__()
-    assert checkpoint.state_schema_version == 2
+    assert checkpoint.state_schema_version == 3
     # A record of another scene is rejected on its description, however its arrays compare
     other_desc = dataclasses.replace(checkpoint.scene, entities=checkpoint.scene.entities[:-1])
     other_checkpoint = dataclasses.replace(checkpoint, scene=other_desc, digest=description_digest(other_desc))
@@ -662,6 +661,21 @@ def test_pickle_resume(n_envs, requires_grad, checkpoint_scene, tmp_path, show_v
     assert_equal(resumed_state.links_pos, landing_state.links_pos)
     assert_equal(loaded_scene.entities[1].get_contacts()["force_a"], landing_contacts["force_a"])
 
+    legacy_state = dataclasses.replace(checkpoint, sim=dataclasses.replace(checkpoint.sim), state_schema_version=2)
+    del legacy_state.sim.auxiliary
+    scene.__setstate__(pickle.loads(pickle.dumps(legacy_state)))
+    assert_equal(scene.get_time(), read_time)
+    assert_equal(box.get_pos(), read_box_pos)
+    assert_equal(arm.get_qpos(), read_arm_qpos)
+    assert_equal(box.get_coup_friction_scale(), read_friction_scale)
+    for _ in range(10):
+        scene.step()
+    resumed_state = scene.sim.rigid_solver.get_state()
+    assert_equal(resumed_state.qpos, landing_state.qpos)
+    assert_equal(resumed_state.dofs_vel, landing_state.dofs_vel)
+    with pytest.raises(gs.GenesisException, match="requires auxiliary simulator state"):
+        scene.__setstate__(dataclasses.replace(legacy_state, state_schema_version=3))
+
     # A record names every array, so a restore raises on a missing or extra array and names the difference. A restore
     # of a record with another 'n_envs' raises and names both counts.
     rigid = checkpoint.sim.solvers["RigidSolver"]
@@ -679,10 +693,11 @@ def test_pickle_resume(n_envs, requires_grad, checkpoint_scene, tmp_path, show_v
     with pytest.raises(gs.GenesisException, match="dyn_state.geoms.coup_friction_scale"):
         scene.__setstate__(state)
     with pytest.raises(gs.GenesisException, match="unsupported state schema version"):
-        scene.__setstate__(dataclasses.replace(state, state_schema_version=3))
+        scene.__setstate__(dataclasses.replace(state, state_schema_version=4))
 
     # Schema 1 pickles carry the original fields without a schema marker.
     del state.state_schema_version
+    del state.sim.auxiliary
     box.set_coup_friction_scale(0.5)
     scene.__setstate__(pickle.loads(pickle.dumps(state)))
     assert_equal(box.get_coup_friction_scale(), 1.0)
@@ -765,7 +780,7 @@ def test_trajectory_replay(n_envs, checkpoint_scene, tmp_path, show_viewer, capl
     with exact_path.open("rb") as file:
         file.seek(len(MAGIC))
         (length,) = LENGTH.unpack(file.read(LENGTH.size))
-        assert json.loads(file.read(length))["state_schema_version"] == 2
+        assert json.loads(file.read(length))["state_schema_version"] == 3
 
     # Each file holds the frame before each step, the state the reset left behind and the state the recording stopped
     # at. Both trajectories play in the same scene.
@@ -898,7 +913,7 @@ def test_trajectory_replay_across_backends(n_envs, trajectory_snapshot, tmp_path
     for version, renamed_field, message in (
         (1, "RigidSolver.dyn_state.dofs.vel", "dyn_state.dofs.vel"),
         (2, None, "dyn_state.geoms.coup_friction_scale"),
-        (3, None, "unsupported trajectory state schema version"),
+        (4, None, "unsupported trajectory state schema version"),
     ):
         manifest = json.loads(manifest_data)
         manifest["state_schema_version"] = version

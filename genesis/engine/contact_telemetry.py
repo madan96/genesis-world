@@ -36,14 +36,17 @@ class ContactTelemetry:
         ).field(shape=(capacity, self.n_envs), layout=qd.Layout.SOA)
         self.attempted_count = qd.field(gs.qd_int, shape=self.n_envs)
         self.interval = qd.field(gs.qd_float, shape=self.n_envs)
-        self.links = qd.types.struct(
+        links_type = qd.types.struct(
             impulse=gs.qd_vec3,
             angular_impulse=gs.qd_vec3,
             normal_impulse=gs.qd_float,
             position_weighted=gs.qd_vec3,
             area_time=gs.qd_float,
             peak_normal_impulse=gs.qd_float,
-        ).field(shape=(max(n_links, 1), self.n_envs), layout=qd.Layout.SOA)
+        )
+        self.links = links_type.field(shape=(max(n_links, 1), self.n_envs), layout=qd.Layout.SOA)
+        # Partial sums bound accumulation error when thousands of grid contacts act on one rigid link.
+        self.links_partial = links_type.field(shape=(max(n_links, 1), self.n_envs, 32), layout=qd.Layout.SOA)
 
     @property
     def row_fields(self) -> tuple[qd.Field, ...]:
@@ -71,10 +74,10 @@ class ContactTelemetry:
             self.links.peak_normal_impulse,
         )
 
-    def get_state(self) -> MPMContactState:
+    def get_state(self, *, compact: bool = True) -> MPMContactState:
         """Capture owned observations, compacting rows to the largest retained count across environments."""
         attempted = qd_to_torch(self.attempted_count, transpose=True, copy=True)
-        count = min(attempted.max().item(), self.capacity)
+        count = min(attempted.max().item(), self.capacity) if compact else self.capacity
         return MPMContactState(
             attempted,
             qd_to_torch(self.interval, transpose=True, copy=True),
@@ -116,6 +119,7 @@ class ContactTelemetry:
                 torch.mps.synchronize()
         else:
             kernel_reset_contact_telemetry(envs_idx, self)
+        kernel_reset_contact_partials(envs_idx, self)
 
     def advance_interval(self, dt: float) -> None:
         """Advance once for every completed MPM collision substep, including empty ones."""
@@ -126,6 +130,45 @@ class ContactTelemetry:
                 torch.mps.synchronize()
         else:
             kernel_advance_contact_interval(dt, self)
+        kernel_reduce_contact_partials(self)
+
+
+@qd.kernel
+def kernel_reset_contact_partials(envs_idx: qd.types.ndarray(), telemetry: qd.template()):
+    for i_l, i_b_, i_s in qd.ndrange(telemetry.n_links, envs_idx.shape[0], telemetry.links_partial.shape[2]):
+        i_b = envs_idx[i_b_]
+        telemetry.links_partial[i_l, i_b, i_s].impulse = 0.0
+        telemetry.links_partial[i_l, i_b, i_s].angular_impulse = 0.0
+        telemetry.links_partial[i_l, i_b, i_s].normal_impulse = 0.0
+        telemetry.links_partial[i_l, i_b, i_s].position_weighted = 0.0
+        telemetry.links_partial[i_l, i_b, i_s].area_time = 0.0
+        telemetry.links_partial[i_l, i_b, i_s].peak_normal_impulse = 0.0
+
+
+@qd.kernel
+def kernel_reduce_contact_partials(telemetry: qd.template()):
+    for i_l, i_b in qd.ndrange(telemetry.n_links, telemetry.n_envs):
+        impulse = qd.Vector.zero(gs.qd_float, 3)
+        angular_impulse = qd.Vector.zero(gs.qd_float, 3)
+        normal_impulse = gs.qd_float(0.0)
+        position_weighted = qd.Vector.zero(gs.qd_float, 3)
+        area_time = gs.qd_float(0.0)
+        peak_normal_impulse = gs.qd_float(0.0)
+        for i_s in range(telemetry.links_partial.shape[2]):
+            impulse += telemetry.links_partial[i_l, i_b, i_s].impulse
+            angular_impulse += telemetry.links_partial[i_l, i_b, i_s].angular_impulse
+            normal_impulse += telemetry.links_partial[i_l, i_b, i_s].normal_impulse
+            position_weighted += telemetry.links_partial[i_l, i_b, i_s].position_weighted
+            area_time += telemetry.links_partial[i_l, i_b, i_s].area_time
+            peak_normal_impulse = qd.max(
+                peak_normal_impulse, telemetry.links_partial[i_l, i_b, i_s].peak_normal_impulse
+            )
+        telemetry.links[i_l, i_b].impulse = impulse
+        telemetry.links[i_l, i_b].angular_impulse = angular_impulse
+        telemetry.links[i_l, i_b].normal_impulse = normal_impulse
+        telemetry.links[i_l, i_b].position_weighted = position_weighted
+        telemetry.links[i_l, i_b].area_time = area_time
+        telemetry.links[i_l, i_b].peak_normal_impulse = peak_normal_impulse
 
 
 @qd.kernel
@@ -167,15 +210,16 @@ def record_contact(
     telemetry: qd.template(),
 ):
     """Record a resolved impulse on the rigid link; the soft body receives its negative."""
-    normal_impulse = qd.max(0.0, -impulse_on_rigid.dot(outward_normal))
-    telemetry.links[link_idx, env_idx].impulse += impulse_on_rigid
-    telemetry.links[link_idx, env_idx].angular_impulse += position.cross(impulse_on_rigid)
-    telemetry.links[link_idx, env_idx].normal_impulse += normal_impulse
-    telemetry.links[link_idx, env_idx].position_weighted += position * normal_impulse
-    telemetry.links[link_idx, env_idx].area_time += area * dt
-    qd.atomic_max(telemetry.links[link_idx, env_idx].peak_normal_impulse, normal_impulse)
-
     row_idx = qd.atomic_add(telemetry.attempted_count[env_idx], 1)
+    i_s = row_idx % telemetry.links_partial.shape[2]
+    normal_impulse = qd.max(0.0, -impulse_on_rigid.dot(outward_normal))
+    telemetry.links_partial[link_idx, env_idx, i_s].impulse += impulse_on_rigid
+    telemetry.links_partial[link_idx, env_idx, i_s].angular_impulse += position.cross(impulse_on_rigid)
+    telemetry.links_partial[link_idx, env_idx, i_s].normal_impulse += normal_impulse
+    telemetry.links_partial[link_idx, env_idx, i_s].position_weighted += position * normal_impulse
+    telemetry.links_partial[link_idx, env_idx, i_s].area_time += area * dt
+    qd.atomic_max(telemetry.links_partial[link_idx, env_idx, i_s].peak_normal_impulse, normal_impulse)
+
     if row_idx < telemetry.capacity:
         telemetry.rows[row_idx, env_idx].entity = entity_idx
         telemetry.rows[row_idx, env_idx].region = region_idx

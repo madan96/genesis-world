@@ -24,6 +24,7 @@ from genesis.engine.entities.base_entity import Entity, EntityDescription
 from genesis.engine.entities.rigid_entity import KinematicEntity
 from genesis.engine.force_fields import ForceField
 from genesis.engine.materials.base import EntityT, Material
+from genesis.engine.states.checkpoint import check_arrays
 from genesis.engine.states.solvers import STATE_SCHEMA_VERSION, SimState, SimulatorCheckpoint
 from genesis.options import (
     BaseCouplerOptions,
@@ -44,6 +45,7 @@ from genesis.options import (
 from genesis.options.morphs import Morph
 from genesis.options.recorders import RecorderOptions, TrajectoryFile
 from genesis.options.renderers import RendererOptions
+from genesis.options.sensors.options import SensorOptions
 from genesis.options.surfaces import Surface
 from genesis.recorders import RecorderManager
 from genesis.recorders.trajectory import Trajectory, save_checkpoint
@@ -60,7 +62,7 @@ if TYPE_CHECKING:
     from genesis.engine.entities.rigid_entity import RigidEntity
     from genesis.engine.sensors.base_sensor import Sensor
     from genesis.engine.simulator import Simulator
-    from genesis.options.sensors.options import SensorOptions, SensorT
+    from genesis.options.sensors.options import SensorT
     from genesis.recorders import Recorder
 
 
@@ -77,6 +79,7 @@ class SceneDescription:
 
     options: SceneOptions
     entities: list[EntityDescription] = dataclasses.field(default_factory=list)
+    sensors: list[SensorOptions] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -596,7 +599,9 @@ class Scene(RBC):
         sensor_options : SensorOptions
             The options for the sensor.
         """
-        return self._sim._sensor_manager.create_sensor(sensor_options)
+        sensor = self._sim._sensor_manager.create_sensor(sensor_options)
+        self._desc.sensors.append(sensor_options)
+        return sensor
 
     @gs.assert_built
     def read_sensors(self, envs_idx=None) -> "dict[type[Sensor], torch.Tensor]":
@@ -686,7 +691,7 @@ class Scene(RBC):
         """
 
         def data_func() -> TrajectorySource:
-            self._reject_unexportable()
+            self._reject_unexportable(checkpoint=True)
             return TrajectorySource(self._sim, self.desc, self._layout)
 
         return self._recorder_manager.add_recorder(data_func, rec_options)
@@ -1566,7 +1571,7 @@ class Scene(RBC):
     # ----------------------------------- utilities --------------------------------------
     # ------------------------------------------------------------------------------------
 
-    def _reject_unexportable(self) -> None:
+    def _reject_unexportable(self, *, checkpoint: bool = False) -> None:
         """Raise when the scene holds an entity, an emitter or a force field no description covers, and warn about what
         'export' leaves out.
         """
@@ -1576,11 +1581,11 @@ class Scene(RBC):
         rejected_kinds = Counter(type(entity).__name__ for entity in self.entities if entity.desc is None)
         rejected_kinds.update(type(emitter).__name__ for emitter in self._emitters)
         rejected_kinds.update(type(force_field).__name__ for force_field in self._sim.solvers[0].force_fields)
-        omitted_kinds = Counter(type(sensor).__name__ for sensor in self._sim._sensor_manager.sensors)
+        omitted_kinds = Counter()
         if self._visualizer is not None:
             omitted_kinds.update(type(camera).__name__ for camera in self._visualizer.cameras)
         if self._pre_step_callbacks:
-            omitted_kinds["pre_step_callback"] += len(self._pre_step_callbacks)
+            (rejected_kinds if checkpoint else omitted_kinds)["pre_step_callback"] += len(self._pre_step_callbacks)
         surfaces = [entity.surface for entity in self.entities]
         if isinstance(self.options.renderer, gs.renderers.RayTracer) and self.options.renderer.env_surface is not None:
             surfaces.append(self.options.renderer.env_surface)
@@ -1614,9 +1619,9 @@ class Scene(RBC):
         simulation had run to, so the simulated state has to be reproduced by stepping it again. Adding an entity
         resolves its description, so a scene is exported before it is built as readily as after.
 
-        Only a rigid or a kinematic entity carries a description. A scene
-        holding anything that alters the simulation raises, naming it: an emitter and a force field. Everything else
-        a description leaves out is written without, with a warning naming it: a camera, a sensor, a callback Genesis
+        Rigid, kinematic and MPM entities and continuous Hybrid bindings carry resolved descriptions. Sensor options
+        travel with them. A scene holding an unsupported entity, an emitter or a force field raises. Everything else
+        a description leaves out is written without, with a warning naming it: a camera, a callback Genesis
         calls at every step, a texture read from an HDR or EXR file, and the visual vertices an entity was given at
         runtime. A recorder neither simulates nor draws, so it is left out without a word.
 
@@ -1685,6 +1690,8 @@ class Scene(RBC):
         # replaces.
         for desc in described.entities:
             scene._sim._add_entity(desc=desc)
+        for options in described.sensors:
+            scene.add_sensor(options)
         return scene
 
     @gs.assert_built
@@ -1701,7 +1708,7 @@ class Scene(RBC):
         state : SceneCheckpoint
             The scene as its description, the environment layout it was built with, and the state of its simulator.
         """
-        self._reject_unexportable()
+        self._reject_unexportable(checkpoint=True)
         return SceneCheckpoint(
             scene=self.desc,
             digest=self._desc_digest,
@@ -1715,18 +1722,30 @@ class Scene(RBC):
 
     @gs.assert_built
     def save_checkpoint(self, path: str | os.PathLike) -> None:
-        """Write the whole state of this scene to a file, for 'load_checkpoint' to open a copy standing where it stands.
+        """Write the supported simulation state to a native file for 'load_checkpoint' to resume.
 
-        The file holds the scene as 'export' writes it and every array of the simulation, scratch included, so the
-        exact state of a failing run is kept for inspection. It is a trajectory file of one frame (see 'TrajectoryFile'),
-        and 'load_trajectory' opens it as such.
+        The file holds the scene as 'export' writes it, its continuation state, and the registered solver work
+        arrays for inspection. Temporary contact-reduction buffers are rebuilt at the next step. It is a trajectory
+        file of one frame (see 'TrajectoryFile'), and 'load_trajectory' opens it as such.
+
+        Rigid and forward MPM state includes clocks, motor targets, passive forces, particle deformation, pending
+        particle commands, moving grids, continuous Hybrid attachments, contact observations and sensor histories
+        and electronics. Sampled particle geometry and resolved bindings travel with the file, so restoration reads
+        no source asset. Future noisy samples can replay with load_checkpoint(restore_rng=True). Saving captures
+        PyTorch random streams without advancing them; Python, NumPy and application-owned generators are excluded.
+
+        Differentiable MPM, CPIC, particle constraints, callback-based Hybrid attachment, pre-step callbacks, emitters,
+        force fields and IPC raise. Cameras, application controllers, planners, recorders and external device state
+        are outside this file. Call between scene steps, with no concurrent scene mutation. The completed file
+        replaces the destination atomically. Matching backend, precision and engine source provide the strongest
+        continuation agreement. Parallel floating-point reductions can still change the last bits.
 
         Parameters
         ----------
         path : str or os.PathLike
             The '.gstraj' file to write.
         """
-        self._reject_unexportable()
+        self._reject_unexportable(checkpoint=True)
         save_checkpoint(path, TrajectorySource(self._sim, self.desc, self._layout))
 
     @classmethod
@@ -1737,11 +1756,17 @@ class Scene(RBC):
         viewer_options: ViewerOptions | None = None,
         vis_options: VisOptions | None = None,
         renderer: RendererOptions | None = None,
+        *,
+        restore_rng: bool = False,
     ) -> "Scene":
         """Create and build the scene a checkpoint file holds, standing in the final state the file records.
 
         The file is one written by 'save_checkpoint' or by recording a 'TrajectoryFile' to its end. The viewer,
-        visualizer and renderer options may be replaced (see 'load').
+        visualizer and renderer options may be replaced (see 'load'). Initialize Genesis before loading; schema 3
+        requires the recorded precision. Schemas 1 and 2 retain their rigid-state compatibility but carry no sensor
+        history or random streams. Use restore_rng=False when reading them.
+        Cross-backend continuation can differ numerically. Exact future noisy samples require restore_rng=True,
+        matching backend and matching engine source, with other random consumers coordinated by the caller.
 
         Parameters
         ----------
@@ -1755,6 +1780,11 @@ class Scene(RBC):
             Visualizer options replacing the recorded ones. Defaults to None.
         renderer : RendererOptions, optional
             Renderer replacing the recorded one. Defaults to None.
+        restore_rng : bool, optional
+            Restore the recorded process-wide PyTorch CPU and simulation-device random streams for future sensor
+            noise. Requires the same device backend. This explicitly rewinds unrelated PyTorch callers too, so the
+            caller must coordinate them. Defaults to False, which leaves future draws under caller control. Scene
+            construction can consume random draws for initial sensor randomization before the saved state is loaded.
 
         Returns
         -------
@@ -1762,7 +1792,7 @@ class Scene(RBC):
             The built scene, in the recorded state.
         """
         trajectory = Trajectory(path, None, show_viewer, viewer_options, vis_options, renderer)
-        trajectory.seek(len(trajectory) - 1)
+        trajectory.seek(len(trajectory) - 1, restore_rng=restore_rng)
         return trajectory.scene
 
     @classmethod
@@ -1813,16 +1843,20 @@ class Scene(RBC):
 
         The scene must be built from the description the state was read from, with the same environment layout, since
         the arrays written back are the ones that build allocates. A state from another layout is rejected, and a state
-        from another build by the names of the arrays that differ. Everything around the state restarts as under
-        'reset': the gradient tape, the sensors and the recorders forget the run that led here, and the visualizer
-        redraws.
+        from another build by the names of the arrays that differ. The gradient tape and recorders restart and the
+        visualizer redraws. Schema 3 restores contact observations, sensor histories and electronics alongside physics.
+        Future stochastic draws remain under caller control.
 
         Parameters
         ----------
         state : SceneCheckpoint
             The state to put back, as read by '__getstate__' or cut from a trajectory frame.
         """
-        if type(state.state_schema_version) is not int or state.state_schema_version not in (1, STATE_SCHEMA_VERSION):
+        if type(state.state_schema_version) is not int or state.state_schema_version not in (
+            1,
+            2,
+            STATE_SCHEMA_VERSION,
+        ):
             gs.raise_exception(f"The checkpoint holds unsupported state schema version {state.state_schema_version!r}.")
         if state.layout != self._layout:
             gs.raise_exception(
@@ -1856,11 +1890,21 @@ class Scene(RBC):
                 state = dataclasses.replace(
                     state,
                     sim=dataclasses.replace(state.sim, solvers={**state.sim.solvers, "RigidSolver": rigid}),
-                    state_schema_version=STATE_SCHEMA_VERSION,
+                    state_schema_version=2,
                 )
         for name, solver in solvers.items():
             record = state.sim.solvers[name]
             check_data((item for item in solver.data if item.kind in record.kinds), record.arrays)
+        if state.state_schema_version >= 3:
+            if state.sim.auxiliary is None:
+                gs.raise_exception("A schema 3 checkpoint requires auxiliary simulator state.")
+            check_arrays(
+                {key: value for key, value in self._sim.checkpoint_arrays().items() if not key.startswith("rng.")},
+                {key: value for key, value in state.sim.auxiliary.items() if not key.startswith("rng.")},
+            )
+            substep = state.sim.auxiliary["substep"][0]
+            if substep < 0 or substep % self.sim.substeps:
+                gs.raise_exception("Checkpoint substep must be a nonnegative completed scene-step boundary.")
         # The recorders finish the run first (see 'reset'), and the restart follows the state, so the visualizer draws
         # the state put back.
         self._recorder_manager.record(self._sim.cur_step_global)

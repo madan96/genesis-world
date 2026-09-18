@@ -12,8 +12,9 @@ from .contacts import ContactObservationState
 
 
 # State schema 1 applies the material's coupling friction directly. Schema 2 records its per-geom, per-environment
-# scale explicitly. The trajectory container and array layouts continue to use GSTRAJ1.
-STATE_SCHEMA_VERSION = 2
+# scale explicitly. Schema 3 adds simulator clocks, pending particle inputs, contacts, sensor state and PyTorch random
+# streams. Schemas 1 and 2 remain readable with their original reset semantics. The trajectory container uses GSTRAJ1.
+STATE_SCHEMA_VERSION = 3
 
 
 @dataclasses.dataclass
@@ -70,6 +71,8 @@ class SimulatorCheckpoint:
 
     steps: np.ndarray | torch.Tensor
     solvers: dict[str, SolverCheckpoint]
+    # Schemas 1 and 2 omit this attribute; the class default also serves unpickled instances.
+    auxiliary: dict[str, np.ndarray | torch.Tensor] | None = None
 
 
 class SimState(RBC):

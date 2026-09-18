@@ -63,9 +63,10 @@ def _kernel_splat_contact_wrenches(
                         weight = 1.0
                     force_share = weight * contact_force
                     couple_share = (contact_pos - probe_pos).cross(force_share)
+                    i_s = i_c % result.shape[1]
                     for i in qd.static(range(3)):
-                        qd.atomic_add(result[i_b, 0, i_p, i], force_share[i])
-                        qd.atomic_add(result[i_b, 1, i_p, i], couple_share[i])
+                        qd.atomic_add(result[i_b, i_s, 0, i_p, i], force_share[i])
+                        qd.atomic_add(result[i_b, i_s, 1, i_p, i], couple_share[i])
 
 
 class SolverContactTaxelReturnType(NamedTuple):
@@ -133,6 +134,7 @@ class TactileReadoutState:
     hysteresis_scale: torch.Tensor
     crosstalk: torch.Tensor | None
     raw: torch.Tensor
+    partial_wrenches: torch.Tensor
     probe_world: torch.Tensor
     positions_link: torch.Tensor
     normals_link: torch.Tensor
@@ -304,6 +306,8 @@ class SolverContactTaxelSensor(
             hysteresis_scale=torch.ones((B, 1, 1, 1), dtype=gs.tc_float, device=gs.device),
             crosstalk=crosstalk,
             raw=torch.zeros((B, 2, P, 3), dtype=gs.tc_float, device=gs.device),
+            # Partial sums limit float32 roundoff and atomic contention when many contacts share one taxel.
+            partial_wrenches=torch.zeros((B, 32, 2, P, 3), dtype=gs.tc_float, device=gs.device),
             probe_world=torch.zeros((B, P, 3), dtype=gs.tc_float, device=gs.device),
             positions_link=torch.zeros((B, P, 3), dtype=gs.tc_float, device=gs.device),
             normals_link=torch.zeros((B, P, 3), dtype=gs.tc_float, device=gs.device),
@@ -371,11 +375,18 @@ class SolverContactTaxelSensor(
                 if "rigid" not in options.contact_sources:
                     valid &= contacts.source == SOURCE_HYBRID
             sign = torch.where(is_a, 1.0, -1.0).to(gs.tc_float)
-            readout.raw.zero_()
+            readout.partial_wrenches.zero_()
             if contacts.valid.shape[1] > 0:
                 _kernel_splat_contact_wrenches(
-                    valid, contacts.position, contacts.force, sign, readout.probe_world, readout.radii, readout.raw
+                    valid,
+                    contacts.position,
+                    contacts.force,
+                    sign,
+                    readout.probe_world,
+                    readout.radii,
+                    readout.partial_wrenches,
                 )
+            torch.sum(readout.partial_wrenches, dim=1, out=readout.raw)
             readout.raw.copy_(gu.inv_transform_by_quat(readout.raw, readout.link_quat[:, None, None, :]))
             raw_data_T[readout.cache_slice] = readout.raw.reshape(B, -1).T
 

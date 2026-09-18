@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import struct
+import tempfile
 import threading
 import time
 import zlib
@@ -24,6 +25,7 @@ import torch
 
 import genesis as gs
 from genesis.engine.solvers import KinematicSolver
+from genesis.engine.states.checkpoint import check_arrays, random_state, restore_random_state
 from genesis.engine.states.solvers import (
     STATE_SCHEMA_VERSION,
     KinematicSolverCheckpoint,
@@ -65,6 +67,7 @@ CHECKPOINT_FILE_KINDS = frozenset(DataKind) - {DataKind.CONFIG, DataKind.CONSTAN
 # The per-environment step counts and the forward-kinematics flags of a solver, which follow the arrays in a frame.
 STEPS_FIELD = "steps"
 FLAGS_SUFFIX = ".forward_flags"
+AUXILIARY_PREFIX = "Simulator."
 
 
 class FrameField(NamedTuple):
@@ -133,6 +136,12 @@ def _frame_fields(sim: "Simulator", kinds: frozenset[DataKind]) -> list[FrameFie
             name = f"{type(solver).__name__}{FLAGS_SUFFIX}"
             fields.append(FrameField(name, DataKind.STATE, (2,), "|u1", offset, 2))
             offset += 2
+    for name, value in sim.checkpoint_arrays().items():
+        array = tensor_to_array(value)
+        fields.append(
+            FrameField(f"{AUXILIARY_PREFIX}{name}", DataKind.STATE, array.shape, array.dtype.str, offset, array.nbytes)
+        )
+        offset += array.nbytes
     return fields
 
 
@@ -152,10 +161,14 @@ def _read_frame(sim: "Simulator", kinds: frozenset[DataKind]) -> np.ndarray:
         parts = [qd_to_torch(value).contiguous().reshape(-1).view(torch.uint8) for _, value, _ in sim.data(kinds)]
         parts.append(sim.steps.reshape(-1).view(torch.uint8))
         parts.append(torch.tensor(flags, dtype=torch.uint8, device=gs.device))
+        parts.extend(
+            value.to(gs.device).contiguous().reshape(-1).view(torch.uint8) for value in sim.checkpoint_arrays().values()
+        )
         return tensor_to_array(torch.cat(parts))
     parts = [qd_to_numpy(value).reshape(-1).view(np.uint8) for _, value, _ in sim.data(kinds)]
     parts.append(tensor_to_array(sim.steps).reshape(-1).view(np.uint8))
     parts.append(np.array(flags, dtype=np.uint8))
+    parts.extend(tensor_to_array(value).reshape(-1).view(np.uint8) for value in sim.checkpoint_arrays().values())
     return np.concatenate(parts)
 
 
@@ -196,10 +209,20 @@ def save_checkpoint(path: str | os.PathLike, source: "TrajectorySource") -> None
     'Scene.save_checkpoint').
     """
     fields = _frame_fields(source.sim, CHECKPOINT_FILE_KINDS)
-    with open(path, "wb") as file:
-        file.write(_header(source, exact=True, chunk_size=1, fields=fields, last_fields=fields))
-        payload = zlib.compress(_read_frame(source.sim, CHECKPOINT_FILE_KINDS).tobytes())
-        file.write(LAST_MAGIC + LAST_HEADER.pack(len(payload), zlib.crc32(payload)) + payload)
+    header = _header(source, exact=True, chunk_size=1, fields=fields, last_fields=fields)
+    payload = zlib.compress(_read_frame(source.sim, CHECKPOINT_FILE_KINDS).tobytes())
+    file = tempfile.NamedTemporaryFile(dir=os.path.dirname(os.path.abspath(path)), delete=False)
+    temporary_path = file.name
+    try:
+        with file:
+            file.write(header)
+            file.write(LAST_MAGIC + LAST_HEADER.pack(len(payload), zlib.crc32(payload)) + payload)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
 
 
 @register_recording(TrajectoryFile)
@@ -405,10 +428,16 @@ class Trajectory:
             self._state_schema_version = self._manifest.get("state_schema_version", 1)
             if type(self._state_schema_version) is not int or self._state_schema_version not in (
                 1,
+                2,
                 STATE_SCHEMA_VERSION,
             ):
                 gs.raise_exception(
                     f"'{path}' holds unsupported trajectory state schema version {self._state_schema_version!r}."
+                )
+            if self._state_schema_version >= 3 and self._manifest["precision"] != np.dtype(gs.np_float).name:
+                gs.raise_exception(
+                    f"'{path}' records {self._manifest['precision']} state. Initialize Genesis with matching precision "
+                    "before loading this checkpoint."
                 )
             (length,) = LENGTH.unpack(file.read(LENGTH.size))
             description = file.read(length)
@@ -520,19 +549,35 @@ class Trajectory:
         # Multiplied as the simulator multiplies its own clock, so the two agree to the bit.
         return tensor_to_array(torch.as_tensor(self.frame(index)[STEPS_FIELD], device="cpu") * self._manifest["dt"])
 
-    def seek(self, index: int) -> None:
+    def seek(self, index: int, *, restore_rng: bool = False) -> None:
         """Put the scene in the state of frame 'index', counted from the end when negative.
 
-        An exact frame puts back everything a step reads or writes, so the scene steps on from there bit-for-bit. A
-        compressed frame puts back the state and recomputes the link and geom poses by forward kinematics. The scratch a
-        checkpoint file also holds is for inspection: its shape follows the backend of the recording.
+        An exact frame restores every persistent physics array. A compressed frame recomputes link and geom poses
+        by forward kinematics. Matching precision is required for schema 3. Matching backend and engine source give
+        the strongest continuation agreement, subject to floating-point reduction order. Recorded scratch arrays
+        remain available through 'frame' for inspection and follow the recording backend's shapes.
+
+        Sensor histories and electronics are restored. Future random draws stay under caller control by default.
+        Setting restore_rng=True explicitly rewinds process-wide PyTorch CPU and simulation-device streams, including
+        streams used by unrelated callers, and requires the recording backend. Coordinate other random consumers to
+        reproduce subsequent noisy samples. Older schemas contain no random stream state and reject this option.
         """
+        if restore_rng and self._manifest["backend"] != gs.backend.name:
+            gs.raise_exception("Restoring PyTorch random streams requires the checkpoint's simulation backend.")
         kinds = EXACT_KINDS if self.is_exact else COMPRESSED_KINDS
         values = self.frame(index, kinds)
+        auxiliary = {
+            name[len(AUXILIARY_PREFIX) :]: value for name, value in values.items() if name.startswith(AUXILIARY_PREFIX)
+        }
+        if restore_rng:
+            check_arrays(
+                {f"rng.{key}": value for key, value in random_state().items()},
+                {key: value for key, value in auxiliary.items() if key.startswith("rng.")},
+            )
         arrays: dict[str, dict[str, np.ndarray]] = {}
         flags: dict[str, tuple[bool, bool]] = {}
         for name, value in values.items():
-            if name == STEPS_FIELD:
+            if name == STEPS_FIELD or name.startswith(AUXILIARY_PREFIX):
                 continue
             solver_name, array_name = name.split(".", 1)
             if name.endswith(FLAGS_SUFFIX):
@@ -549,7 +594,7 @@ class Trajectory:
                 )
             else:
                 solvers[solver_name] = SolverCheckpoint(solver_arrays, {}, kinds)
-        sim = SimulatorCheckpoint(steps=values[STEPS_FIELD], solvers=solvers)
+        sim = SimulatorCheckpoint(steps=values[STEPS_FIELD], solvers=solvers, auxiliary=auxiliary)
         self._scene.__setstate__(
             self._checkpoint_class(
                 scene=self._scene.desc,
@@ -559,6 +604,8 @@ class Trajectory:
                 state_schema_version=self._state_schema_version,
             )
         )
+        if restore_rng:
+            restore_random_state(auxiliary)
 
     def play(self, loop: bool = False) -> None:
         """Seek every frame in turn, which redraws the scene at each and plays the run in the viewer at its pace.

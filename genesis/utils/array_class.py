@@ -129,7 +129,10 @@ def iter_data(struct, name: str, kind: DataKind | None = None) -> Iterator[DataI
     of its kind, named 'grad'. A static config yields one item of kind CONFIG, and anything else raises and names the
     offending slot.
     """
-    if isinstance(struct, (qd.Tensor, qd.Field, qd.Ndarray)):
+    if isinstance(struct, qd.StructField):
+        for member in struct.keys:
+            yield from iter_data(struct.get_member_field(member), f"{name}.{member}", kind)
+    elif isinstance(struct, (qd.Tensor, qd.Field, qd.Ndarray)):
         if kind is None:
             gs.raise_exception(f"'{name}' holds an array that no struct or annotation gives a kind.")
         yield DataItem(name, struct, kind)
@@ -169,6 +172,8 @@ def check_data(items: Iterable[DataItem], values: Mapping[str, np.ndarray | torc
     for name, array, _ in items:
         value = values[name]
         element_shape = array.element_shape if isinstance(array, (qd.VectorTensor, qd.MatrixTensor)) else ()
+        if isinstance(array, qd.MatrixField):
+            element_shape = (array.n,) if array.m == 1 else (array.n, array.m)
         if tuple(array.shape) == () or tuple(value.shape) == element_shape:
             continue
         shape = (*array.shape, *element_shape)

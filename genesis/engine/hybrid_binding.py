@@ -2,16 +2,44 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+import trimesh
 
 import quadrants as qd
 
 import genesis as gs
 from genesis.engine.states.contacts import HybridAttachmentState, restore_contact_field
 from genesis.engine.hybrid_attachment import kernel_apply_attachment, kernel_attachment_stability
+from genesis.engine.materials.base import Material
 from genesis.options.hybrid import HybridBindingOptions, HybridCollisionOptions, HybridMassOptions, HybridSkinOptions
 from genesis.options.solvers import LegacyCouplerOptions
 from genesis.utils import geom, hybrid_skin
 from genesis.utils.misc import assign_indexed_tensor, indices_to_mask, qd_to_torch
+
+
+@dataclass
+class HybridBindingDescription:
+    """Resolved attachment geometry and mass allocation, referencing preceding scene entities by index."""
+
+    rigid_entity_idx: int
+    soft_entity_idx: int
+    options: HybridBindingOptions
+    collision_options: HybridCollisionOptions
+    surface_world: trimesh.Trimesh
+    links_reference_pose: dict[int, tuple[np.ndarray, np.ndarray]]
+    links_idx: np.ndarray
+    weights: np.ndarray
+    active_count: np.ndarray
+    rest_local_pos: np.ndarray
+    region_names: list[str]
+    vertex_regions: np.ndarray | None
+    particles_region: np.ndarray
+    soft_materials: list[Material]
+    vertex_material_id: np.ndarray
+    vertex_surface_contact: np.ndarray
+    particle_material_id: np.ndarray
+    particle_surface_contact: np.ndarray
+    particle_mass: np.ndarray
+    soft_mass_by_link: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -59,7 +87,37 @@ class HybridBindingDiagnostics:
 class HybridBinding:
     """Reference geometry, particle attachment and mass allocation for one continuous skin."""
 
-    def __init__(self, entity, scene, material, morph, surface):
+    def __init__(self, entity, scene, material, morph, surface, desc: HybridBindingDescription | None = None):
+        if desc is not None:
+            self.entity = entity
+            self.options = desc.options
+            self.is_force_limited = self.options.max_correction_force is not None
+            self.collision_options = desc.collision_options
+            self.part_rigid = scene.entities[desc.rigid_entity_idx]
+            self.part_soft = scene.entities[desc.soft_entity_idx]
+            self.surface_world = desc.surface_world
+            self.links_reference_pose = desc.links_reference_pose
+            self.links_idx = desc.links_idx
+            self.weights = desc.weights
+            self.active_count = desc.active_count
+            self.rest_local_pos = desc.rest_local_pos
+            self.region_names = desc.region_names
+            self.vertex_regions = desc.vertex_regions
+            self.particles_region = desc.particles_region
+            self.n_particles = self.part_soft.n_particles
+            self.soft_materials = [self.part_soft.material]
+            for soft_material in desc.soft_materials[1:]:
+                self.part_soft.solver.add_material(soft_material)
+                self.soft_materials.append(soft_material)
+            self.vertex_material_id = desc.vertex_material_id
+            self.vertex_surface_contact = desc.vertex_surface_contact
+            self.particle_material_id = desc.particle_material_id
+            self.particle_surface_contact = desc.particle_surface_contact
+            self.particle_mass = desc.particle_mass
+            self.soft_mass_by_link = desc.soft_mass_by_link
+            self.part_soft.solver.register_hybrid_binding(self)
+            self.desc = desc
+            return
         if not isinstance(morph, gs.morphs.URDF):
             gs.raise_exception("Continuous Hybrid skin requires one URDF articulation.")
         if not isinstance(material.material_soft, gs.materials.MPM.Base):
@@ -181,6 +239,28 @@ class HybridBinding:
         self._apply_mass_accounting(particles)
         self._configure_collision_roles()
         self.part_soft.solver.register_hybrid_binding(self)
+        self.desc = HybridBindingDescription(
+            self.part_rigid.idx,
+            self.part_soft.idx,
+            self.options,
+            self.collision_options,
+            self.surface_world,
+            self.links_reference_pose,
+            self.links_idx,
+            self.weights,
+            self.active_count,
+            self.rest_local_pos,
+            self.region_names,
+            self.vertex_regions,
+            self.particles_region,
+            self.soft_materials,
+            self.vertex_material_id,
+            self.vertex_surface_contact,
+            self.particle_material_id,
+            self.particle_surface_contact,
+            self.particle_mass,
+            self.soft_mass_by_link,
+        )
 
     def _apply_mass_accounting(self, particles):
         links = self.part_rigid.links

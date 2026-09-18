@@ -10,6 +10,7 @@ import quadrants as qd
 
 import genesis as gs
 from genesis.typing import NonNegativeFloat, PositiveFloat, StrictInt, ValidFloat
+from genesis.utils import serialization
 
 from ..base import Material
 
@@ -34,7 +35,7 @@ DEFAULT_SAMPLER = "pbs" if (sys.platform == "linux" and platform.machine() == "x
 
 
 @qd.data_oriented
-class Base(Material["MPMEntity"]):
+class Base(Material["MPMEntity"], serialization.SerializationMixin):
     """
     The base class of MPM materials.
 
@@ -82,6 +83,20 @@ class Base(Material["MPMEntity"]):
 
     # Internal solver state - does not belong in an options class, kept pending larger refactor.
     _default_Jp: float = PrivateAttr(default=1.0)
+
+    def export(self, exporting: serialization.Exporting) -> dict:
+        """Store material parameters, rebuilding constitutive dispatch from the material class on load."""
+        values = vars(self)
+        return {
+            name: exporting.value(values[name], field.annotation)
+            for name, field in type(self).model_fields.items()
+            if not field.exclude
+        }
+
+    @classmethod
+    def load(cls, raw, loading: serialization.Loading):
+        values = {name: loading.value(value, cls.model_fields[name].annotation) for name, value in raw.items()}
+        return cls(**values)
 
     def model_post_init(self, context: Any) -> None:
         # Resolve Lame parameters
