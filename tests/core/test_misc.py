@@ -327,7 +327,7 @@ def test_sanitize_index_rejects_invalid_collections(index):
 @pytest.mark.required
 @pytest.mark.parametrize("as_boolean", (False, True))
 def test_indices_to_mask_selects_the_cross_product(as_boolean):
-    buf = torch.arange(20, dtype=torch.int32).reshape((4, 5))
+    buf = torch.arange(20, dtype=torch.int32, device=gs.device).reshape((4, 5))
     if as_boolean:
         envs_idx = torch.tensor((False, True, False, True))
         dofs_idx = torch.tensor((True, False, True, False, False))
@@ -339,6 +339,13 @@ def test_indices_to_mask_selects_the_cross_product(as_boolean):
     # these inputs would give the two values on the diagonal.
     assert_equal(buf[indices_to_mask(envs_idx, dofs_idx)], torch.tensor(((5, 7), (15, 17)), dtype=torch.int32))
     assert_equal(buf[indices_to_mask(envs_idx)], buf[torch.tensor((1, 3))])
+    assert_equal(buf[indices_to_mask(range(-3, 0, 2), range(-5, 0, 2))], ((5, 7, 9), (15, 17, 19)))
+    assert_equal(buf[indices_to_mask(range(3, -1, -2), range(4, -1, -2))], ((19, 17, 15), (9, 7, 5)))
+    assert_equal(buf[indices_to_mask(range(-1, 1), range(1, 4, 2))], ((16, 18), (1, 3)))
+    assert_equal(
+        buf[indices_to_mask(slice(None, None, -2), slice(4, None, -2), axis_sizes=buf.shape)],
+        ((19, 17, 15), (9, 7, 5)),
+    )
 
 
 @pytest.mark.required

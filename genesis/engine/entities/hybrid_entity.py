@@ -2,16 +2,17 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import numpy as np
-import quadrants as qd
+import torch
 import trimesh
 
+import quadrants as qd
+
 import genesis as gs
-import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
 import genesis.utils.urdf as uu
+from genesis.engine.hybrid_binding import HybridBinding, HybridBindingDiagnostics, HybridMassBreakdown
 from genesis.ext.urdfpy.urdf import URDF
-from genesis.engine.hybrid_binding import HybridBinding
-
+from genesis.utils import array_class
 from genesis.utils.hybrid import (
     check_graph,
     compute_graph_attribute,
@@ -482,17 +483,17 @@ class HybridEntity(Entity):
         return list(self._skin_binding.region_names) if self._skin_binding is not None else []
 
     @gs.assert_built
-    def get_mass_breakdown(self):
+    def get_mass_breakdown(self) -> HybridMassBreakdown:
         """Return owned batched mass and world center-of-mass tensors for continuous skin."""
         return self._skin_binding.get_mass_breakdown()
 
     @gs.assert_built
-    def get_binding_diagnostics(self):
+    def get_binding_diagnostics(self) -> HybridBindingDiagnostics:
         """Return owned binding tensors and per-environment attachment impulse and energy diagnostics."""
         return self._skin_binding.get_binding_diagnostics()
 
     @gs.assert_built
-    def get_attachment_link_wrench(self):
+    def get_attachment_link_wrench(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return step-mean world force and torque about the world origin, shaped [B, links, 3]."""
         return self._skin_binding.get_attachment_link_wrench()
 

@@ -1,7 +1,6 @@
 from typing import TYPE_CHECKING
 
 import numpy as np
-import torch
 
 import quadrants as qd
 
@@ -15,7 +14,6 @@ from genesis.repr_base import RBC
 from genesis.utils import array_class
 from genesis.utils.array_class import LinksState
 from genesis.utils.geom import qd_inv_transform_by_trans_quat, qd_transform_by_trans_quat
-from genesis.utils.misc import broadcast_tensor
 
 if TYPE_CHECKING:
     from genesis.engine.simulator import Simulator
@@ -62,12 +60,6 @@ class LegacyCoupler(RBC):
         ):
             self.rigid_solver.collider._sdf.activate()
 
-        if self.rigid_solver.is_active:
-            # Per-geom, per-environment multiplier on geoms_info.coup_friction for particle-rigid coupling. It keeps
-            # its values across resets so an episode randomization survives scene.reset().
-            self.coup_friction_scale = qd.field(gs.qd_float, shape=(self.rigid_solver.n_geoms_, self.sim._B))
-            self.coup_friction_scale.fill(1.0)
-
         if self._rigid_mpm and self.mpm_solver.enable_CPIC:
             # this field stores the geom index of the thin shell rigid object (if any) that separates particle and its surrounding grid cell
             self.cpic_flag = qd.field(gs.qd_int, shape=(self.mpm_solver.n_particles, 3, 3, 3, self.mpm_solver._B))
@@ -108,10 +100,6 @@ class LegacyCoupler(RBC):
         if self._mpm_pbd:
             self.mpm_pbd_stencil_size = int(np.floor(self.mpm_solver.dx / self.pbd_solver.hash_grid_cell_size) + 2)
 
-        ## DEBUG
-        self._dx = 1 / 1024
-        self._stencil_size = int(np.floor(self._dx / self.sph_solver.hash_grid_cell_size) + 2)
-
         if self.mpm_solver.is_active and (self.mpm_solver.is_moving_window or self.mpm_solver.regions.n_regions > 1):
             if self._fem_mpm or self._mpm_sph or self._mpm_pbd:
                 gs.raise_exception("Moving and multi-region MPM grids support rigid, tool and MPM contact.")
@@ -139,34 +127,7 @@ class LegacyCoupler(RBC):
         )
         if self._accumulates_rigid_impulses:
             self.rigid_impulses = RigidImpulses(self.rigid_solver)
-        self.reset(envs_idx=self.sim.scene._envs_idx)
-
-    def set_coup_friction_scale(self, value, geoms_idx=None, envs_idx=None):
-        """Scale the coupling friction of rigid geoms per environment for particle-rigid contact.
-
-        The effective friction coefficient of geom ``g`` in environment ``b`` is ``coup_friction[g] * scale[g, b]``.
-        ``value`` broadcasts to ``(len(envs_idx), len(geoms_idx))``. ``geoms_idx`` holds global geom indices and
-        defaults to every geom; ``envs_idx`` defaults to every environment. Scales default to 1 and persist across
-        ``scene.reset()``.
-        """
-        if not self.rigid_solver.is_active:
-            gs.raise_exception("set_coup_friction_scale requires an active rigid solver.")
-        envs_idx = self.sim.scene._sanitize_envs_idx(envs_idx)
-        if geoms_idx is None:
-            geoms_idx = torch.arange(self.rigid_solver.n_geoms, dtype=gs.tc_int, device=gs.device)
-        else:
-            geoms_idx = torch.as_tensor(geoms_idx, dtype=gs.tc_int, device=gs.device)
-        values = broadcast_tensor(value, gs.tc_float, (len(envs_idx), len(geoms_idx)), ("envs_idx", "geoms_idx"))
-        self._kernel_set_coup_friction_scale(geoms_idx, envs_idx, values.contiguous())
-
-    @qd.kernel
-    def _kernel_set_coup_friction_scale(
-        self, geoms_idx: qd.types.ndarray(), envs_idx: qd.types.ndarray(), values: qd.types.ndarray()
-    ):
-        for i_g_, i_b_ in qd.ndrange(geoms_idx.shape[0], envs_idx.shape[0]):
-            i_g = geoms_idx[i_g_]
-            i_b = envs_idx[i_b_]
-            self.coup_friction_scale[i_g, i_b] = values[i_b_, i_g_]
+        self.reset()
 
     def on_step_begin(self):
         if self.contact_telemetry is not None:
@@ -175,6 +136,8 @@ class LegacyCoupler(RBC):
             self.mpm_solver.active_cell_count.fill(0)
 
     def reset(self, envs_idx=None) -> None:
+        if envs_idx is not None:
+            envs_idx = self.sim.scene._sanitize_envs_idx(envs_idx)
         if self.contact_telemetry is not None:
             self.contact_telemetry.reset(self.sim.scene._envs_idx if envs_idx is None else envs_idx)
         if self._rigid_mpm and self.mpm_solver.enable_CPIC:
@@ -256,7 +219,17 @@ class LegacyCoupler(RBC):
                 geom_idx, batch_idx, pos_world, geoms_state, geoms_info, rigid_info, sdf_info, collider_static_config
             )
             vel = self._func_collide_in_rigid_geom(
-                pos_world, vel, mass, normal_rigid, influence, geom_idx, batch_idx, geoms_info, links_state, rigid_info
+                pos_world,
+                vel,
+                mass,
+                normal_rigid,
+                influence,
+                geom_idx,
+                batch_idx,
+                geoms_state,
+                geoms_info,
+                links_state,
+                rigid_info,
             )
 
         return vel
@@ -295,7 +268,17 @@ class LegacyCoupler(RBC):
         #     normal_rigid = normal_prev
         if influence > 0.1:
             vel = self._func_collide_in_rigid_geom(
-                pos_world, vel, mass, normal_rigid, influence, geom_idx, batch_idx, geoms_info, links_state, rigid_info
+                pos_world,
+                vel,
+                mass,
+                normal_rigid,
+                influence,
+                geom_idx,
+                batch_idx,
+                geoms_state,
+                geoms_info,
+                links_state,
+                rigid_info,
             )
 
         # Static fluid pressure pushes on the geom even at rest, where the velocity-gated collision response above
@@ -335,6 +318,7 @@ class LegacyCoupler(RBC):
         influence,
         geom_idx,
         i_b,
+        geoms_state: array_class.GeomsState,
         geoms_info: array_class.GeomsInfo,
         links_state: array_class.LinksState,
         rigid_info: array_class.RigidInfo,
@@ -367,7 +351,7 @@ class LegacyCoupler(RBC):
                     rvel_tan_norm
                     + rvel_normal_magnitude
                     * geoms_info.coup_friction[geom_idx]
-                    * self.coup_friction_scale[geom_idx, i_b],
+                    * geoms_state.coup_friction_scale[geom_idx, i_b],
                 )
             )
 
@@ -431,6 +415,7 @@ class LegacyCoupler(RBC):
                         influence,
                         i_g,
                         i_b,
+                        geoms_state,
                         geoms_info,
                         links_state,
                         rigid_info,
@@ -826,8 +811,8 @@ class LegacyCoupler(RBC):
                         vel_fem_sv = self.fem_solver.elements_v[f + 1, iv, i_b].vel
                         mass_fem_sv = mass / 4.0
 
-                        dx = self.sph_solver.hash_grid_cell_size  # self._dx
-                        stencil_size = 2  # self._stencil_size
+                        dx = self.sph_solver.hash_grid_cell_size
+                        stencil_size = 2
 
                         base = self.sph_solver.sh.pos_to_grid(pos - 0.5 * dx)
 

@@ -151,6 +151,7 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
             vel_in=gs.qd_vec3,  # input momentum/velocity
             vel_out=gs.qd_vec3,  # output momentum/velocity
             mass_gradient=gs.qd_vec3,
+            friction_mass=gs.qd_float,
         )
         # Grid is only ever indexed at [f] (never [f+1]) in p2g/g2p/reset/coupler, so substeps_local frames are enough.
         # Particles still need substeps_local + 1 because g2p writes the next-frame state at [f+1].
@@ -267,6 +268,12 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
 
             if self._enable_CPIC and self.sim.rigid_solver.is_active and self.sim.rigid_solver.n_geoms:
                 self.sim.rigid_solver.collider._sdf.activate()
+
+            self.material_friction = qd.field(gs.qd_float, shape=len(self._materials_idx))
+            friction = np.empty(len(self._materials_idx), dtype=gs.np_float)
+            for material in self._materials:
+                friction[material.idx] = material.friction
+            self.material_friction.from_numpy(friction)
 
             self.init_particle_fields()
             self.init_grid_fields()
@@ -511,6 +518,9 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
                                     gradient[i_axis] *= w[offset[j_axis]][j_axis]
                         self.grid[f, cell_ijk, i_r, i_b].mass_gradient -= gradient * self.particles_info[i_p].mass
                         mass_contrib = weight * self.particles_info[i_p].mass
+                        if qd.static(self.regions.n_regions > 1):
+                            i_m = self.particles_info.material_idx[i_p]
+                            self.grid[f, cell_ijk, i_r, i_b].friction_mass += mass_contrib * self.material_friction[i_m]
                         prev_mass = qd.atomic_add(self.grid[f, cell_ijk, i_r, i_b].mass, mass_contrib)
                         # Sparse-reset bookkeeping runs forward-only: backward mode composes p2g through autodiff where
                         # these atomics are meaningless. Per-env first-writer (prev_mass == 0) tries to claim the cell
@@ -534,6 +544,7 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
     def g2p(
         self,
         f: qd.i32,
+        geoms_state: array_class.GeomsState,
         geoms_info: array_class.GeomsInfo,
         links_state: array_class.LinksState,
         rigid_info: array_class.RigidInfo,
@@ -565,6 +576,7 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
                                 1.0,
                                 sep_geom_idx,
                                 i_b,
+                                geoms_state=geoms_state,
                                 geoms_info=geoms_info,
                                 links_state=links_state,
                                 rigid_info=rigid_info,
@@ -664,8 +676,9 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
         """Return owned grid diagnostics with an environment axis first.
 
         Origins and allocated sizes are cell indices; occupancy bounds use world meters and contain (+inf, -inf) for
-        environments with no active particles. Active-cell substeps accumulate nodal occupancy until the environment
-        resets. Error flags stay set until reset, and ``check_errno`` raises on them at the simulator's check cadence.
+        environments with no active particles. Active-cell substeps count occupied region nodes across substeps of
+        the current scene step. Selected resets clear these counts. Error flags stay set until reset, and
+        ``check_errno`` raises on them at the simulator's check cadence.
         """
         if not self.is_active:
             gs.raise_exception("Grid diagnostics require an active MPM solver.")
@@ -701,6 +714,7 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
     def substep_post_coupling(self, f):
         self.g2p(
             f,
+            self.sim.coupler.rigid_solver.dyn_state.geoms,
             self.sim.coupler.rigid_solver.dyn_info.geoms,
             self.sim.coupler.rigid_solver.dyn_state.links,
             self.sim.coupler.rigid_solver.rigid_info,
@@ -739,6 +753,7 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
     def substep_post_coupling_grad(self, f):
         self.g2p.grad(
             f,
+            self.sim.coupler.rigid_solver.dyn_state.geoms,
             self.sim.coupler.rigid_solver.dyn_info.geoms,
             self.sim.coupler.rigid_solver.dyn_state.links,
             self.sim.coupler.rigid_solver.rigid_info,
@@ -774,10 +789,14 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
             self.grid[f, i, j, k, i_r, i_b].vel_in = qd.Vector.zero(gs.qd_float, 3)
             self.grid[f, i, j, k, i_r, i_b].mass = gs.qd_float(0.0)
             self.grid[f, i, j, k, i_r, i_b].vel_out = qd.Vector.zero(gs.qd_float, 3)
+            self.grid[f, i, j, k, i_r, i_b].mass_gradient = qd.Vector.zero(gs.qd_float, 3)
+            self.grid[f, i, j, k, i_r, i_b].friction_mass = gs.qd_float(0.0)
 
             self.grid.grad[f, i, j, k, i_r, i_b].vel_in = qd.Vector.zero(gs.qd_float, 3)
             self.grid.grad[f, i, j, k, i_r, i_b].mass = gs.qd_float(0.0)
             self.grid.grad[f, i, j, k, i_r, i_b].vel_out = qd.Vector.zero(gs.qd_float, 3)
+            self.grid.grad[f, i, j, k, i_r, i_b].mass_gradient = qd.Vector.zero(gs.qd_float, 3)
+            self.grid.grad[f, i, j, k, i_r, i_b].friction_mass = gs.qd_float(0.0)
 
     @qd.kernel
     def reset_dirty_cells(self, f: qd.i32):
@@ -792,6 +811,7 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
                 self.grid[f, i, j, k, i_r, i_b].vel_in = 0.0
                 self.grid[f, i, j, k, i_r, i_b].vel_out = 0.0
                 self.grid[f, i, j, k, i_r, i_b].mass_gradient = 0.0
+                self.grid[f, i, j, k, i_r, i_b].friction_mass = 0.0
             if i_b == 0:
                 self.grid_dirty_flag[i, j, k] = 0
 

@@ -100,6 +100,7 @@ def kernel_get_state(
     links_pos: qd.types.ndarray(),
     links_quat: qd.types.ndarray(),
     friction_ratio: qd.types.ndarray(),
+    coup_friction_scale: qd.types.ndarray(),
     dyn_state: array_class.DynState,
     rigid_info: array_class.RigidInfo,
     rigid_config: qd.template(),
@@ -129,6 +130,7 @@ def kernel_get_state(
     qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
     for i_l, i_b in qd.ndrange(n_geoms, _B):
         friction_ratio[i_b, i_l] = dyn_state.geoms.friction_ratio[i_l, i_b]
+        coup_friction_scale[i_b, i_l] = dyn_state.geoms.coup_friction_scale[i_l, i_b]
 
 
 @qd.kernel(fastcache=True)
@@ -140,6 +142,7 @@ def kernel_set_state(
     links_pos: qd.types.ndarray(),
     links_quat: qd.types.ndarray(),
     friction_ratio: qd.types.ndarray(),
+    coup_friction_scale: qd.types.ndarray(),
     dyn_state: array_class.DynState,
     rigid_info: array_class.RigidInfo,
     rigid_config: qd.template(),
@@ -173,6 +176,7 @@ def kernel_set_state(
     qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
     for i_l, i_b_ in qd.ndrange(n_geoms, _B):
         dyn_state.geoms.friction_ratio[i_l, envs_idx[i_b_]] = friction_ratio[envs_idx[i_b_], i_l]
+        dyn_state.geoms.coup_friction_scale[i_l, envs_idx[i_b_]] = coup_friction_scale[envs_idx[i_b_], i_l]
 
 
 @qd.kernel(fastcache=True)
@@ -575,6 +579,21 @@ def kernel_set_links_inertia(
         # An inertia moves no center of mass, so every velocity stands where it stood.
         refresh_velocity=False,
     )
+
+
+@qd.kernel(fastcache=True)
+def kernel_set_geoms_coup_friction_scale(
+    geoms_idx: qd.types.ndarray(),
+    envs_idx: qd.types.ndarray(),
+    values: qd.types.ndarray(),
+    dyn_state: array_class.DynState,
+    rigid_config: qd.template(),
+):
+    qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
+    for i_g_, i_b_ in qd.ndrange(geoms_idx.shape[0], envs_idx.shape[0]):
+        i_g = geoms_idx[i_g_]
+        i_b = envs_idx[i_b_]
+        dyn_state.geoms.coup_friction_scale[i_g, i_b] = values[i_b_, i_g_]
 
 
 @qd.kernel(fastcache=True)

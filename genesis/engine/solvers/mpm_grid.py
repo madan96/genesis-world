@@ -43,7 +43,6 @@ class GridRegions:
         self.n_regions = len(self.names)
         is_bonded = np.eye(self.n_regions, dtype=bool)
         is_collision_enabled = np.ones((self.n_regions, max(1, solver.sim.rigid_solver.n_geoms)), dtype=bool)
-        friction = np.zeros(self.n_regions, dtype=gs.np_float)
         for binding in solver._hybrid_bindings:
             fields = fields_by_entity[binding.part_soft.idx]
             region_overrides = binding.collision_options.region_overrides or {}
@@ -74,7 +73,6 @@ class GridRegions:
                     if link.idx in excluded_links:
                         for geom in link.geoms:
                             is_collision_enabled[i_field, geom.idx] = False
-                friction[i_field] = binding.part_rigid.material.friction
                 for j_field, j_r in fields:
                     is_bonded[i_field, j_field] = adjacent[i_r, j_r]
         self.entity_idx = qd.field(gs.qd_int, shape=self.n_regions)
@@ -82,13 +80,11 @@ class GridRegions:
         self.is_surface_contact = qd.field(gs.qd_bool, shape=self.n_regions)
         self.is_bonded = qd.field(gs.qd_bool, shape=(self.n_regions, self.n_regions))
         self.is_collision_enabled = qd.field(gs.qd_bool, shape=is_collision_enabled.shape)
-        self.friction = qd.field(gs.qd_float, shape=self.n_regions)
         self.entity_idx.from_numpy(np.array(self.entities, dtype=gs.np_int))
         self.region_idx.from_numpy(np.array(region_ids, dtype=gs.np_int))
         self.is_surface_contact.from_numpy(np.array(surface_contact, dtype=bool))
         self.is_bonded.from_numpy(is_bonded)
         self.is_collision_enabled.from_numpy(is_collision_enabled)
-        self.friction.from_numpy(friction)
 
 
 @qd.kernel
@@ -177,7 +173,7 @@ def kernel_contact_grid_fields(f: qd.i32, solver: qd.template()):
                 parent[i_r] = root
                 mass = solver.grid[f, cell, i_r, i_b].mass
                 masses[root] += mass
-                frictions[root] += mass * solver.regions.friction[i_r]
+                frictions[root] += solver.grid[f, cell, i_r, i_b].friction_mass
                 if mass > 0.0 and solver.regions.is_surface_contact[i_r]:
                     surface_contact[root] = 1
                 for i_axis in qd.static(range(3)):

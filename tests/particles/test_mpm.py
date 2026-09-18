@@ -63,6 +63,8 @@ def test_grid_state_reset(grid_mode, show_viewer):
     expected_origin[selection] = saved_diagnostics.origin_cell[selection]
     assert_allclose(restored_diagnostics.origin_cell, expected_origin, atol=0)
     assert_allclose(restored_diagnostics.active_particles, entity.n_particles, atol=0)
+    assert_allclose(restored_diagnostics.active_cell_substeps[selection], 0, atol=0)
+    assert_allclose(restored_diagnostics.active_cell_substeps[1], diagnostics.active_cell_substeps[1], atol=0)
     if grid_mode == "moving_window":
         assert restored_diagnostics.allocated_cells_per_env < restored_diagnostics.dense_cells_per_env / 5
         assert not torch.equal(expected_origin[0], expected_origin[1])
@@ -241,6 +243,10 @@ def test_window_world_contact(n_envs, show_viewer):
         velocities = entity.get_particles_vel()
         if n_envs == 0:
             positions, velocities = positions[None], velocities[None]
+        diagnostics = solver.get_grid_diagnostics()
+        assert_allclose(diagnostics.active_particles, entity.n_particles, atol=0)
+        assert (diagnostics.active_cell_substeps > 0).all()
+        assert (diagnostics.active_cell_substeps <= diagnostics.allocated_cells_per_env * scene.substeps).all()
         # Grid-node coupling stops the material at the first grid node inside the wall face at x = 0.9
         wall_node_x = math.ceil(0.9 / solver.dx) * solver.dx
         assert_allclose(positions[0, :, 0].max(), wall_node_x, atol=1e-3)

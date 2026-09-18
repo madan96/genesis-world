@@ -15,7 +15,7 @@ import trimesh
 import genesis as gs
 import genesis.utils.geom as gu
 from genesis.engine.scene import SCENE_FORMAT, description_digest
-from genesis.recorders.trajectory import CHUNK_MAGIC, TRAJECTORY_FORMAT, Trajectory
+from genesis.recorders.trajectory import CHUNK_MAGIC, LENGTH, MAGIC, TRAJECTORY_FORMAT, Trajectory
 from genesis.utils.misc import get_assets_dir, tensor_to_array
 from genesis.utils.serialization import ARRAY_MEMBER, MANIFEST_NAME
 
@@ -589,7 +589,10 @@ def test_pickle_resume(n_envs, requires_grad, checkpoint_scene, tmp_path, show_v
         # scene continues from its own state as the copies do.
         (scene.rigid_solver.get_state().qpos ** 2).sum().backward()
 
+    box.set_coup_friction_scale(((0.25,), (0.75,)) if n_envs else 0.25)
+    read_friction_scale = box.get_coup_friction_scale()
     checkpoint = scene.__getstate__()
+    assert checkpoint.state_schema_version == 2
     # A record of another scene is rejected on its description, however its arrays compare
     other_desc = dataclasses.replace(checkpoint.scene, entities=checkpoint.scene.entities[:-1])
     other_checkpoint = dataclasses.replace(checkpoint, scene=other_desc, digest=description_digest(other_desc))
@@ -615,6 +618,7 @@ def test_pickle_resume(n_envs, requires_grad, checkpoint_scene, tmp_path, show_v
     assert_equal(twin_scene.get_time(), read_time)
     assert_equal(twin_scene.entities[1].get_pos(), read_box_pos)
     assert_equal(twin_scene.entities[2].get_qpos(), read_arm_qpos)
+    assert_equal(twin_scene.entities[1].get_coup_friction_scale(), read_friction_scale)
     twin_checkpoint = twin_scene.__getstate__()
     assert_equal(twin_checkpoint.sim.steps, checkpoint.sim.steps)
     for name, record in checkpoint.sim.solvers.items():
@@ -633,7 +637,9 @@ def test_pickle_resume(n_envs, requires_grad, checkpoint_scene, tmp_path, show_v
     assert_equal(twin_scene.entities[4].get_links_pos(), landing_ghost_pos)
     assert_equal(twin_scene.entities[1].get_contacts()["force_a"], landing_contacts["force_a"])
 
+    box.set_coup_friction_scale(0.5)
     scene.__setstate__(checkpoint)
+    assert_equal(box.get_coup_friction_scale(), read_friction_scale)
     assert_equal(scene.get_time(), read_time)
     for _ in range(10):
         scene.step()
@@ -647,6 +653,7 @@ def test_pickle_resume(n_envs, requires_grad, checkpoint_scene, tmp_path, show_v
     # A checkpoint file holds the whole state, so a scene loaded from it steps on where the original went
     loaded_scene = gs.Scene.load_checkpoint(checkpoint_path, show_viewer=show_viewer)
     assert_equal(loaded_scene.get_time(), read_time)
+    assert_equal(loaded_scene.entities[1].get_coup_friction_scale(), read_friction_scale)
     for _ in range(10):
         loaded_scene.step()
     resumed_state = loaded_scene.sim.rigid_solver.get_state()
@@ -665,6 +672,26 @@ def test_pickle_resume(n_envs, requires_grad, checkpoint_scene, tmp_path, show_v
         scene.__setstate__(dataclasses.replace(checkpoint, sim=dataclasses.replace(checkpoint.sim, solvers=solvers)))
     with pytest.raises(gs.GenesisException, match="built with EnvironmentLayout\\(n_envs=3"):
         scene.__setstate__(dataclasses.replace(checkpoint, layout=dataclasses.replace(checkpoint.layout, n_envs=3)))
+
+    arrays = {name: array for name, array in rigid.arrays.items() if name != "dyn_state.geoms.coup_friction_scale"}
+    solvers = {**checkpoint.sim.solvers, "RigidSolver": dataclasses.replace(rigid, arrays=arrays)}
+    state = dataclasses.replace(checkpoint, sim=dataclasses.replace(checkpoint.sim, solvers=solvers))
+    with pytest.raises(gs.GenesisException, match="dyn_state.geoms.coup_friction_scale"):
+        scene.__setstate__(state)
+    with pytest.raises(gs.GenesisException, match="unsupported state schema version"):
+        scene.__setstate__(dataclasses.replace(state, state_schema_version=3))
+
+    # Schema 1 pickles carry the original fields without a schema marker.
+    del state.state_schema_version
+    box.set_coup_friction_scale(0.5)
+    scene.__setstate__(pickle.loads(pickle.dumps(state)))
+    assert_equal(box.get_coup_friction_scale(), 1.0)
+    assert "dyn_state.geoms.coup_friction_scale" not in state.sim.solvers["RigidSolver"].arrays
+    arrays = {name: array for name, array in arrays.items() if name != dropped_name}
+    solvers = {**state.sim.solvers, "RigidSolver": dataclasses.replace(rigid, arrays=arrays)}
+    with pytest.raises(gs.GenesisException, match=f"do not share \\['{dropped_name}'\\]"):
+        scene.__setstate__(dataclasses.replace(state, sim=dataclasses.replace(state.sim, solvers=solvers)))
+    assert_equal(box.get_coup_friction_scale(), 1.0)
 
 
 @pytest.mark.required
@@ -721,6 +748,7 @@ def test_trajectory_replay(n_envs, checkpoint_scene, tmp_path, show_viewer, capl
     states, ghosts_pos, forces, times = [], [], [], []
     for i_step in range(N_STEPS):
         ghost.set_dofs_position([0.01 * i_step, 0.0, 0.0, 0.0, 0.0, 0.0])
+        box.set_coup_friction_scale(0.25 + 0.01 * i_step)
         states.append(scene.sim.rigid_solver.get_state())
         ghosts_pos.append(ghost.get_links_pos())
         forces.append(box.get_contacts()["force_a"])
@@ -734,6 +762,10 @@ def test_trajectory_replay(n_envs, checkpoint_scene, tmp_path, show_viewer, capl
     with pytest.raises(gs.GenesisException, match="cannot hold the header"):
         scene.stop_recording()
     assert not capped_path.exists()
+    with exact_path.open("rb") as file:
+        file.seek(len(MAGIC))
+        (length,) = LENGTH.unpack(file.read(LENGTH.size))
+        assert json.loads(file.read(length))["state_schema_version"] == 2
 
     # Each file holds the frame before each step, the state the reset left behind and the state the recording stopped
     # at. Both trajectories play in the same scene.
@@ -753,6 +785,7 @@ def test_trajectory_replay(n_envs, checkpoint_scene, tmp_path, show_viewer, capl
         assert_equal(replayed_state.links_quat, state.links_quat)
         assert_equal(replay_scene.entities[4].get_links_pos(), ghost_pos)
         assert_equal(replay_scene.entities[1].get_contacts()["force_a"], force)
+        assert_allclose(replay_scene.entities[1].get_coup_friction_scale(), 0.25 + 0.01 * index, tol=gs.EPS)
         assert_equal(replay_scene.get_time(), time)
         assert_equal(exact_trajectory.time(index), time)
         ctrl_pos = exact_trajectory.frame(index)["RigidSolver.dyn_state.dofs.ctrl_pos"]
@@ -765,6 +798,7 @@ def test_trajectory_replay(n_envs, checkpoint_scene, tmp_path, show_viewer, capl
         assert_equal(replayed_state.dofs_vel, state.dofs_vel)
         assert_equal(replayed_state.dofs_acc, state.dofs_acc)
         assert_equal(replay_scene.entities[1].get_contacts()["force_a"], force)
+        assert_allclose(replay_scene.entities[1].get_coup_friction_scale(), 0.25 + 0.01 * index, tol=gs.EPS)
         assert_allclose(replayed_state.links_pos, state.links_pos, tol=tol)
         assert_allclose(replayed_state.links_quat, state.links_quat, tol=tol)
         assert_allclose(replay_scene.entities[4].get_links_pos(), ghost_pos, tol=tol)
@@ -790,6 +824,7 @@ def test_trajectory_replay(n_envs, checkpoint_scene, tmp_path, show_viewer, capl
         assert_equal(trajectory.frame(-1)["RigidSolver.rigid_info.qpos"], tensor_to_array(reset_state.qpos).T)
     exact_trajectory.seek(-1)
     assert_equal(replay_scene.sim.rigid_solver.get_state().qpos, reset_state.qpos)
+    assert_equal(replay_scene.entities[1].get_coup_friction_scale(), 1.0)
     assert_equal(replay_scene.get_time(), 0.0)
 
     # A run cut off inside a chunk keeps every complete chunk and loses the final state
@@ -824,16 +859,18 @@ def test_trajectory_replay(n_envs, checkpoint_scene, tmp_path, show_viewer, capl
 @pytest.mark.required
 @pytest.mark.precision("32")
 @pytest.mark.parametrize("n_envs", [0, 2])
-def test_trajectory_replay_across_backends(n_envs, trajectory_snapshot, show_viewer, tol):
+def test_trajectory_replay_across_backends(n_envs, trajectory_snapshot, tmp_path, show_viewer, tol):
     # The snapshot is a log recorded on CPU in single precision, replayed here on whatever backend the session runs
     trajectory = gs.Scene.load_trajectory(trajectory_snapshot, show_viewer=show_viewer)
     assert trajectory.n_envs == n_envs
     replay_scene = trajectory.scene
     for index in range(len(trajectory)):
         # The state read back is the one the file holds, whatever this backend stores its flags and floats as
+        replay_scene.rigid_solver.set_geoms_coup_friction_scale(0.25)
         trajectory.seek(index)
         frame = trajectory.frame(index)
         state = replay_scene.sim.rigid_solver.get_state()
+        assert_equal(state.coup_friction_scale, 1.0)
         assert_equal(tensor_to_array(state.qpos).T, frame["RigidSolver.rigid_info.qpos"])
         assert_equal(tensor_to_array(state.dofs_vel).T, frame["RigidSolver.dyn_state.dofs.vel"])
         # The frame holds the arrays as the solver lays them out, links first and environments second
@@ -851,3 +888,26 @@ def test_trajectory_replay_across_backends(n_envs, trajectory_snapshot, show_vie
                 following_frame["RigidSolver.dyn_state.dofs.vel"],
                 tol=tol,
             )
+
+    with trajectory_snapshot.open("rb") as file:
+        file.seek(len(MAGIC))
+        (length,) = LENGTH.unpack(file.read(LENGTH.size))
+        manifest_data = file.read(length)
+        payload = file.read()
+    invalid_path = tmp_path / f"invalid{TRAJECTORY_FORMAT}"
+    for version, renamed_field, message in (
+        (1, "RigidSolver.dyn_state.dofs.vel", "dyn_state.dofs.vel"),
+        (2, None, "dyn_state.geoms.coup_friction_scale"),
+        (3, None, "unsupported trajectory state schema version"),
+    ):
+        manifest = json.loads(manifest_data)
+        manifest["state_schema_version"] = version
+        for row in manifest["fields"]:
+            if row[0] == renamed_field:
+                row[0] = "RigidSolver.unknown_field"
+        text = json.dumps(manifest).encode()
+        invalid_path.write_bytes(MAGIC + LENGTH.pack(len(text)) + text + payload)
+        replay_scene.rigid_solver.set_geoms_coup_friction_scale(0.25)
+        with pytest.raises(gs.GenesisException, match=message):
+            Trajectory(invalid_path, scene=replay_scene).seek(0)
+        assert_equal(replay_scene.rigid_solver.get_geoms_coup_friction_scale(), 0.25)

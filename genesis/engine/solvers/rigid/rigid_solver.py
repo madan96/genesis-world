@@ -156,6 +156,7 @@ from .abd.accessor import (
     kernel_set_geom_friction,
     kernel_set_geom_friction_rolling,
     kernel_set_geom_friction_torsional,
+    kernel_set_geoms_coup_friction_scale,
     kernel_set_geoms_friction,
     kernel_set_geoms_friction_ratio,
     kernel_set_geoms_friction_rolling,
@@ -1781,6 +1782,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 state.links_pos,
                 state.links_quat,
                 state.friction_ratio,
+                state.coup_friction_scale,
                 self.dyn_state,
                 self.rigid_info,
                 self.rigid_config,
@@ -1818,6 +1820,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             cfrc_vel_dst = qd_to_torch(self.dyn_state.links.cfrc_applied_vel, transpose=True, copy=False)
             cfrc_ang_dst = qd_to_torch(self.dyn_state.links.cfrc_applied_ang, transpose=True, copy=False)
             fric_dst = qd_to_torch(self.dyn_state.geoms.friction_ratio, transpose=True, copy=False)
+            coup_fric_dst = qd_to_torch(self.dyn_state.geoms.coup_friction_scale, transpose=True, copy=False)
             # Setting the state is a discontinuity: wake every body in the affected envs (a body left hibernated would
             # stay frozen), restoring the flags and the awake-dof count alongside the other state buffers.
             if self._use_hibernation:
@@ -1856,6 +1859,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 cfrc_ang_dst.masked_fill_(envs_mask[:, None, None], 0.0)
                 if self.n_geoms:
                     torch.where(envs_mask[:, None], state.friction_ratio, fric_dst, out=fric_dst)
+                    torch.where(envs_mask[:, None], state.coup_friction_scale, coup_fric_dst, out=coup_fric_dst)
                 if self._use_hibernation:
                     links_hibernated_dst.masked_fill_(envs_mask[:, None], 0)
                     awake_steps_dst.masked_fill_(envs_mask[:, None], 0)
@@ -1879,6 +1883,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 cfrc_ang_dst[envs_idx] = 0.0
                 if self.n_geoms:
                     fric_dst[envs_idx] = state.friction_ratio[envs_idx]
+                    coup_fric_dst[envs_idx] = state.coup_friction_scale[envs_idx]
                 if self._use_hibernation:
                     links_hibernated_dst[envs_idx] = 0
                     awake_steps_dst[envs_idx] = 0
@@ -1901,6 +1906,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 state.links_pos,
                 state.links_quat,
                 state.friction_ratio,
+                state.coup_friction_scale,
                 self.dyn_state,
                 self.rigid_info,
                 self.rigid_config,
@@ -2442,6 +2448,31 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
     def set_links_COM(self, com, links_idx=None, envs_idx=None):
         """Set the center of mass (COM) of the given links, as an offset from the origin of their local frame."""
         self._set_links_info(com, links_idx, "COM", envs_idx)
+
+    def set_geoms_coup_friction_scale(self, scale, geoms_idx=None, envs_idx=None):
+        if gs.use_zerocopy:
+            if envs_idx is not None:
+                if self.n_envs == 0:
+                    gs.raise_exception("`envs_idx` is not supported for non-parallelized scene.")
+                if isinstance(envs_idx, (int, np.integer)) and not -self.n_envs <= envs_idx < self.n_envs:
+                    gs.raise_exception("`envs_idx` exceeds the scene environment range.")
+            field = qd_to_torch(self.dyn_state.geoms.coup_friction_scale, transpose=True, copy=False)
+            mask = indices_to_mask(envs_idx, geoms_idx, axis_sizes=field.shape)
+            scale = broadcast_tensor(scale, gs.tc_float, field[mask].shape, ("envs_idx", "geoms_idx"))
+        else:
+            scale, geoms_idx, envs_idx = self._sanitize_io_variables(
+                scale, geoms_idx, self.n_geoms, "geoms_idx", envs_idx, skip_allocation=True
+            )
+            if self.n_envs == 0:
+                scale = scale[None]
+        if not torch.isfinite(scale).all() or (scale < 0).any():
+            gs.raise_exception("Coupling friction scales must be finite and nonnegative.")
+        if gs.use_zerocopy:
+            assign_indexed_tensor(field, mask, scale)
+            if gs.backend == gs.metal:
+                torch.mps.synchronize()
+        else:
+            kernel_set_geoms_coup_friction_scale(geoms_idx, envs_idx, scale, self.dyn_state, self.rigid_config)
 
     def set_geoms_friction_ratio(self, friction_ratio, geoms_idx=None, envs_idx=None):
         friction_ratio, geoms_idx, envs_idx = self._sanitize_io_variables(
@@ -3020,6 +3051,10 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             gs.raise_exception("`envs_idx` cannot be specified for non-batched links info.")
         tensor = qd_to_torch(self.dyn_info.links.invweight, envs_idx, links_idx, transpose=True, copy=True)
         return tensor[0] if self.n_envs == 0 and self._options.batch_links_info else tensor
+
+    def get_geoms_coup_friction_scale(self, geoms_idx=None, envs_idx=None):
+        tensor = qd_to_torch(self.dyn_state.geoms.coup_friction_scale, envs_idx, geoms_idx, transpose=True, copy=True)
+        return tensor[0] if self.n_envs == 0 else tensor
 
     def get_geoms_friction_ratio(self, geoms_idx=None, envs_idx=None):
         tensor = qd_to_torch(self.dyn_state.geoms.friction_ratio, envs_idx, geoms_idx, transpose=True, copy=True)

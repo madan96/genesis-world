@@ -4,6 +4,7 @@ import quadrants as qd
 import torch
 
 import genesis as gs
+from genesis.engine.states.contacts import MPMContactLinks, MPMContactRows, MPMContactState, restore_contact_field
 from genesis.utils.misc import qd_to_torch
 
 
@@ -43,6 +44,57 @@ class ContactTelemetry:
             area_time=gs.qd_float,
             peak_normal_impulse=gs.qd_float,
         ).field(shape=(max(n_links, 1), self.n_envs), layout=qd.Layout.SOA)
+
+    @property
+    def row_fields(self) -> tuple[qd.Field, ...]:
+        return (
+            self.rows.entity,
+            self.rows.region,
+            self.rows.geom,
+            self.rows.link,
+            self.rows.substep,
+            self.rows.position,
+            self.rows.normal,
+            self.rows.impulse,
+            self.rows.relative_velocity,
+            self.rows.area_time,
+        )
+
+    @property
+    def link_fields(self) -> tuple[qd.Field, ...]:
+        return (
+            self.links.impulse,
+            self.links.angular_impulse,
+            self.links.normal_impulse,
+            self.links.position_weighted,
+            self.links.area_time,
+            self.links.peak_normal_impulse,
+        )
+
+    def get_state(self) -> MPMContactState:
+        """Capture owned observations, compacting rows to the largest retained count across environments."""
+        attempted = qd_to_torch(self.attempted_count, transpose=True, copy=True)
+        count = min(attempted.max().item(), self.capacity)
+        return MPMContactState(
+            attempted,
+            qd_to_torch(self.interval, transpose=True, copy=True),
+            MPMContactRows(
+                *(qd_to_torch(field, col_mask=slice(count), transpose=True).clone() for field in self.row_fields)
+            ),
+            MPMContactLinks(*(qd_to_torch(field, transpose=True, copy=True) for field in self.link_fields)),
+        )
+
+    def set_state(self, state: MPMContactState, envs_idx=None) -> None:
+        """Restore selected contact observations without changing other environments."""
+        for field, value in (
+            (self.attempted_count, state.attempted_count),
+            (self.interval, state.interval),
+            *zip(self.row_fields, state.rows),
+            *zip(self.link_fields, state.links),
+        ):
+            restore_contact_field(field, value, envs_idx)
+        if gs.backend == gs.metal:
+            torch.mps.synchronize()
 
     def reset(self, envs_idx: torch.Tensor) -> None:
         """Clear selected environments; previously returned snapshots remain owned."""

@@ -119,7 +119,13 @@ def test_grid_simulate_all_link_temps(show_viewer, tol, n_envs):
     HOT_BASE = BASE_TEMP + 80.0
     COLD_BASE = BASE_TEMP - 80.0
 
-    scene = gs.Scene(show_viewer=show_viewer)
+    scene = gs.Scene(
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.4, -0.4, 0.3),
+            camera_lookat=(0.0, 0.0, BOX_SIZE),
+        ),
+        show_viewer=show_viewer,
+    )
     scene.add_entity(gs.morphs.Plane())
     hot_box = scene.add_entity(
         gs.morphs.Box(
@@ -183,3 +189,32 @@ def test_grid_simulate_all_link_temps(show_viewer, tol, n_envs):
 
     assert_allclose(torch.mean(sensor1.read()), link_temps[..., hot_link_idx], tol=2e-2)
     assert_allclose(torch.mean(sensor2.read()), link_temps[..., cold_link_idx], tol=2e-2)
+
+    snapshot = scene.get_state()
+    captured_temperatures = sensor1.link_temperatures.clone()
+    captured_sensor1 = sensor1.read().clone()
+    captured_sensor2 = sensor2.read().clone()
+    expected_temperatures = []
+    expected_sensor1 = []
+    expected_sensor2 = []
+    for _ in range(4):
+        scene.step()
+        expected_temperatures.append(sensor1.link_temperatures.clone())
+        expected_sensor1.append(sensor1.read().clone())
+        expected_sensor2.append(sensor2.read().clone())
+    assert (expected_temperatures[-1][..., hot_link_idx] != captured_temperatures[..., hot_link_idx]).all()
+
+    selected = torch.tensor([True, False], device=gs.device) if n_envs else None
+    scene.reset(snapshot, envs_idx=selected)
+    assert_equal(sensor1.link_temperatures[:1], captured_temperatures[:1])
+    assert_equal(sensor1.read(envs_idx=selected), captured_sensor1[:1] if n_envs else captured_sensor1)
+    assert_equal(sensor2.read(envs_idx=selected), captured_sensor2[:1] if n_envs else captured_sensor2)
+    if n_envs:
+        assert_equal(sensor1.link_temperatures[1:], expected_temperatures[-1][1:])
+        assert_equal(sensor1.read(envs_idx=[1]), expected_sensor1[-1][1:])
+        assert_equal(sensor2.read(envs_idx=[1]), expected_sensor2[-1][1:])
+    for temperatures, data1, data2 in zip(expected_temperatures, expected_sensor1, expected_sensor2):
+        scene.step()
+        assert_allclose(sensor1.link_temperatures[:1], temperatures[:1], atol=5e-5)
+        assert_allclose(sensor1.read(envs_idx=selected), data1[:1] if n_envs else data1, atol=5e-5)
+        assert_allclose(sensor2.read(envs_idx=selected), data2[:1] if n_envs else data2, atol=5e-5)

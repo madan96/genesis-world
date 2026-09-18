@@ -7,6 +7,7 @@ terrain), and contact management.
 """
 
 import math
+from dataclasses import fields
 from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
@@ -17,6 +18,7 @@ import trimesh
 import genesis as gs
 import genesis.engine.solvers.rigid.rigid_solver as rigid_solver
 import genesis.utils.array_class as array_class
+from genesis.engine.states.contacts import RigidContactRows, RigidContactState, restore_contact_field
 from genesis.utils.misc import assign_indexed_tensor, indices_to_mask, qd_to_numpy, qd_to_torch, tensor_to_array
 from genesis.utils.sdf import SDF
 
@@ -776,6 +778,48 @@ class Collider:
     def activate_sdf(self) -> None:
         """Enable SDF queries against this collider's geometry. Idempotent."""
         self._sdf.activate()
+
+    def get_observation_state(self) -> RigidContactState:
+        """Capture owned logical contact rows and link observations on the simulation device."""
+        count = qd_to_torch(self.collider_state.n_contacts, transpose=True, copy=True)
+        n_rows = count.max().item()
+        order = qd_to_torch(self.collider_state.contact_sort_idx, col_mask=slice(n_rows), transpose=True).long()
+        # Unused positions in a shorter environment's permutation are not necessarily valid indices
+        order = order.clamp(0, self.collider_state.contact_sort_idx.shape[0] - 1)
+        rows = []
+        contact_fields = vars(self.collider_state.contact_data)
+        for field in fields(self.collider_state.contact_data):
+            value = qd_to_torch(contact_fields[field.name], transpose=True)
+            indices = order if value.ndim == 2 else order[..., None].expand(-1, -1, value.shape[-1])
+            rows.append(value.gather(1, indices))
+        links = self._solver.dyn_state.links
+        return RigidContactState(
+            count,
+            RigidContactRows(*rows),
+            *(
+                qd_to_torch(field, transpose=True, copy=True)
+                for field in (links.contact_force, links.cd_vel, links.cd_ang, links.root_COM)
+            ),
+        )
+
+    def set_observation_state(self, state: RigidContactState, envs_idx=None) -> None:
+        """Restore selected rigid contact observations after the solver clears its collision caches."""
+        links = self._solver.dyn_state.links
+        contact_fields = vars(self.collider_state.contact_data)
+        for field, value in (
+            (self.collider_state.n_contacts, state.count),
+            *zip((contact_fields[field.name] for field in fields(self.collider_state.contact_data)), state.rows),
+            (links.contact_force, state.link_contact_force),
+            (links.cd_vel, state.link_cd_vel),
+            (links.cd_ang, state.link_cd_ang),
+            (links.root_COM, state.link_root_com),
+        ):
+            restore_contact_field(field, value, envs_idx)
+        order = torch.arange(state.rows.pos.shape[1], dtype=gs.tc_int, device=gs.device)
+        restore_contact_field(self.collider_state.contact_sort_idx, order.expand(state.count.shape[0], -1), envs_idx)
+        if gs.backend == gs.metal:
+            torch.mps.synchronize()
+        self._contact_data_cache.clear()
 
     def reset(self, envs_idx=None, *, cache_only: bool = True) -> None:
         self._contact_data_cache.clear()

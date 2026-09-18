@@ -1,7 +1,11 @@
-from typing import TYPE_CHECKING, Callable
+from collections.abc import Callable
+from math import isclose
+from typing import TYPE_CHECKING
 
-from pydantic import StrictBool
+from pydantic import StrictBool, model_validator
+from typing_extensions import Self
 
+import genesis as gs
 from genesis.options.hybrid import HybridBindingOptions, HybridCollisionOptions, HybridMassOptions, HybridSkinOptions
 from genesis.typing import NonNegativeFloat, ValidFloat
 
@@ -15,6 +19,10 @@ class Hybrid(Material["HybridEntity"]):
     """
     The class for hybrid body material (soft skin actuated by inner rigid skeleton).
 
+    Setting ``skin``, ``binding``, ``mass``, ``collision``, or a nonempty ``material_soft_palette`` selects continuous
+    skin. Its geometry comes from ``skin`` and its attachment parameters from ``binding``. The per-link settings
+    ``damping``, ``thickness``, and ``soft_dv_coef`` must retain their defaults with continuous skin.
+
     Parameters
     ----------
     material_rigid : Material
@@ -24,11 +32,12 @@ class Hybrid(Material["HybridEntity"]):
     use_default_coupling : bool, optional
         Whether to use default solver coupling. Default is False.
     damping : float, optional
-        Damping coefficient between soft and rigid. Default is 0.0.
+        Damping coefficient for per-link attachment. Continuous skin uses ``binding.damping_ratio``. Default is 0.0.
     thickness : float, optional
-        The thickness to instantiate soft skin. Default is 0.05.
+        Thickness for per-link skin construction. Continuous skin uses the geometry selected by ``skin``. Default is 0.05.
     soft_dv_coef : float, optional
-        The coefficient to apply delta velocity from rigid to soft. Default is 0.01.
+        Velocity correction coefficient for per-link attachment. Continuous skin uses ``binding.timeconst``.
+        Default is 0.01.
     func_instantiate_rigid_from_soft : callable, optional
         The function to instantiate rigid body from the geometry of soft body. Default is None.
     func_instantiate_soft_from_rigid : callable, optional
@@ -51,6 +60,21 @@ class Hybrid(Material["HybridEntity"]):
     func_instantiate_rigid_from_soft: Callable | None = None
     func_instantiate_soft_from_rigid: Callable | None = None
     func_instantiate_rigid_soft_association: Callable | None = None
+
+    @model_validator(mode="after")
+    def _validate_attachment_options(self) -> Self:
+        if self.is_explicit:
+            for name, value in (
+                ("damping", self.damping),
+                ("thickness", self.thickness),
+                ("soft_dv_coef", self.soft_dv_coef),
+            ):
+                if not isclose(value, type(self).model_fields[name].default, rel_tol=0.0, abs_tol=0.0):
+                    gs.raise_exception(
+                        f"Hybrid {name} configures per-link attachment and must retain its default with continuous "
+                        "skin. Configure continuous skin with the skin and binding options."
+                    )
+        return self
 
     @property
     def is_explicit(self) -> bool:

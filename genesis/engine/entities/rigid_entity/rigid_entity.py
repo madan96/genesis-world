@@ -3303,6 +3303,42 @@ class RigidEntity(KinematicEntity):
     # ----------------------------------- friction ---------------------------------------
     # ------------------------------------------------------------------------------------
 
+    @gs.assert_built
+    def set_coup_friction_scale(self, scale, geoms_idx_local=None, envs_idx=None):
+        """Scale the material's friction for contact with particles in selected environments.
+
+        ``scale`` is finite and nonnegative and broadcasts to the selected environments and geometries. The effective
+        coefficient is ``material.coup_friction * scale``. A scale of zero permits sliding without friction. Scales
+        default to one and are restored by scene states and resets.
+
+        Parameters
+        ----------
+        scale : array_like
+            Dimensionless multiplier, with shape (n_geoms,) or (n_envs, n_geoms). Scalars broadcast to all selections.
+        geoms_idx_local : array_like or None, optional
+            Local geometry indices. None selects all geometries. Defaults to None.
+        envs_idx : array_like or None, optional
+            Environment indices or Boolean mask. None selects all environments. Defaults to None.
+        """
+        geoms_idx = self._get_global_idx(geoms_idx_local, self.n_geoms, self._geom_start)
+        if ((geoms_idx < self._geom_start) | (geoms_idx >= self.geom_end)).any():
+            gs.raise_exception("`geoms_idx_local` exceeds the entity geometry range.")
+        self._solver.set_geoms_coup_friction_scale(scale, geoms_idx, envs_idx)
+
+    @gs.assert_built
+    def get_coup_friction_scale(self, geoms_idx_local=None, envs_idx=None):
+        """Return an owned tensor of dimensionless particle-contact friction multipliers.
+
+        ``geoms_idx_local`` selects local geometry indices and ``envs_idx`` selects environments by index or Boolean
+        mask. None selects all entries. The result has shape (n_geoms,) for an unbatched scene and (n_envs, n_geoms)
+        otherwise, preserving the order of each selection.
+        """
+        geoms_idx = self._get_global_idx(geoms_idx_local, self.n_geoms, self._geom_start)
+        if ((geoms_idx < self._geom_start) | (geoms_idx >= self.geom_end)).any():
+            gs.raise_exception("`geoms_idx_local` exceeds the entity geometry range.")
+        envs_idx = self._scene._sanitize_envs_idx(envs_idx)
+        return self._solver.get_geoms_coup_friction_scale(geoms_idx, envs_idx)
+
     def set_friction_ratio(self, friction_ratio, links_idx_local=None, envs_idx=None):
         """
         Set the friction ratio of the geoms of the specified links.

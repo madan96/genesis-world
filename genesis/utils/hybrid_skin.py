@@ -119,19 +119,19 @@ def load_skinning(skinning, surface: trimesh.Trimesh, link_name_to_idx: dict[str
     used = indices >= 0
     if np.any(weights[~used] > 0.0):
         gs.raise_exception("Unused Hybrid skinning slots must have zero weight.")
-    weights = np.where(used, np.clip(weights, 0.0, None), 0.0)
-    row_sum = weights.sum(axis=1)
-    dead = np.flatnonzero(row_sum <= 1e-12)
+    row_max = weights.max(axis=1)
+    dead = np.flatnonzero(row_max <= 0.0)
     if dead.size:
         gs.raise_exception(
             f"{dead.size} surface vertices have no positive skinning weight (first: {dead[:8].tolist()}); "
             "every vertex must be normalizable."
         )
 
-    # Map name indices -> global link indices; -1 slots stay -1.
+    # Scale each row before summation to preserve normalization for tiny and near-overflow weights
+    weights = weights / row_max[:, None]
     name_idx_to_link = np.array([link_name_to_idx[name] for name in link_names], dtype=np.int64)
     vert_link_idx = np.where(used, name_idx_to_link[np.clip(indices, 0, None)], -1)
-    vert_weights = weights / row_sum[:, None]
+    vert_weights = weights / weights.sum(axis=1, keepdims=True)
     return vert_link_idx, vert_weights
 
 
@@ -241,9 +241,9 @@ def build_urdf_union_surface(part_rigid, link_poses, pitch: float, inflate: floa
             "Hybrid URDF fallback marching-cubes level is outside the sampled SDF range; "
             "check `urdf_inflate` and `voxel_pitch`."
         )
-    verts, faces, _, _ = marching_cubes(field, level=level)
+    verts, faces, _, _ = marching_cubes(field, level=level, allow_degenerate=False)
     verts = verts * pitch + lo
-    surface = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
+    surface = trimesh.Trimesh(vertices=verts, faces=faces, process=True, validate=True)
     if surface.volume < 0:
         surface.invert()
     validate_solid_surface(surface)

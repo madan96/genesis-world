@@ -6,11 +6,12 @@ import torch
 import quadrants as qd
 
 import genesis as gs
+from genesis.engine.states.contacts import HybridAttachmentState, restore_contact_field
 from genesis.engine.hybrid_attachment import kernel_apply_attachment, kernel_attachment_stability
 from genesis.options.hybrid import HybridBindingOptions, HybridCollisionOptions, HybridMassOptions, HybridSkinOptions
 from genesis.options.solvers import LegacyCouplerOptions
-from genesis.utils import array_class, geom, hybrid_skin
-from genesis.utils.misc import qd_to_torch
+from genesis.utils import geom, hybrid_skin
+from genesis.utils.misc import assign_indexed_tensor, indices_to_mask, qd_to_torch
 
 
 @dataclass(frozen=True)
@@ -25,13 +26,34 @@ class HybridMassBreakdown:
     combined_center_of_mass: torch.Tensor
     link_names: tuple[str, ...]
 
-    def summary(self) -> str:
-        """Copy the totals to the host and format one row per environment."""
-        totals = torch.stack((self.total, self.rigid_total, self.soft_total), dim=-1).detach().cpu().numpy()
-        return "\n".join(
-            f"Environment {i_b}: total={total:.6g} kg, rigid={rigid:.6g} kg, soft={soft:.6g} kg"
-            for i_b, (total, rigid, soft) in enumerate(totals)
-        )
+
+@dataclass(frozen=True)
+class HybridBindingDiagnostics:
+    """Owned binding data and attachment diagnostics on the simulation device.
+
+    Link indices and weights have shape ``[P, K]`` in particle and influence order. Other binding tensors have shape
+    ``[P]``. Global link indices use -1 for unused slots. Region IDs index ``region_names`` and material IDs index the
+    hybrid material palette. Particle masses are in kg. Attachment impulses have shape ``[B, 3]`` in world axes
+    (N s and N m s about the world origin), accumulated over the last scene step. Remaining diagnostics have shape
+    ``[B]``. Damping work is the accumulated dissipative work in joules and spring potential is the last substep's
+    uncapped spring energy in joules. Position error is the step maximum in meters. The dimensionless stability index
+    describes the last checked substep and must be at most one.
+    """
+
+    link_idx: torch.Tensor
+    weights: torch.Tensor
+    active_count: torch.Tensor
+    region_id: torch.Tensor
+    region_names: tuple[str, ...]
+    material_id: torch.Tensor
+    surface_contact: torch.Tensor
+    particle_mass: torch.Tensor
+    attach_pos_err_max: torch.Tensor
+    attach_impulse_sum: torch.Tensor
+    attach_ang_impulse_sum: torch.Tensor
+    damping_work: torch.Tensor
+    spring_potential: torch.Tensor
+    stability_index: torch.Tensor
 
 
 class HybridBinding:
@@ -276,6 +298,35 @@ class HybridBinding:
         )
         self.reset(self.entity.scene._envs_idx)
 
+    @property
+    def observation_fields(self) -> tuple[qd.Field, ...]:
+        return (
+            self.link_impulse,
+            self.link_angular_impulse,
+            self.position_error_max,
+            self.particle_impulse,
+            self.particle_angular_impulse,
+            self.damping_work,
+            self.spring_potential,
+            self.stability_index,
+        )
+
+    def get_observation_state(self) -> HybridAttachmentState:
+        """Capture owned attachment diagnostics and the interval defining their wrench."""
+        return HybridAttachmentState(
+            *(qd_to_torch(field, transpose=True, copy=True) for field in self.observation_fields),
+            self.interval.clone(),
+        )
+
+    def set_observation_state(self, state: HybridAttachmentState, envs_idx=None) -> None:
+        """Restore selected attachment diagnostics, retaining other environments' observations."""
+        for field, value in zip(self.observation_fields, state[:-1]):
+            restore_contact_field(field, value, envs_idx)
+        mask = indices_to_mask(envs_idx)
+        assign_indexed_tensor(self.interval, mask, state.interval[mask])
+        if gs.backend == gs.metal:
+            torch.mps.synchronize()
+
     def reset(self, envs_idx):
         kernel_reset_attachment(envs_idx, self)
         self.interval[envs_idx] = 0.0
@@ -287,7 +338,7 @@ class HybridBinding:
         # The host-side stability test forces a device sync, so it shares the simulator's error-check cadence.
         if self.part_soft.solver.sim._cur_substep_global % gs.engine.simulator.RATE_CHECK_ERRNO == 0:
             kernel_attachment_stability(f, rigid.dyn_state.links, rigid.dyn_info.links, rigid.rigid_config, self)
-            stability = qd_to_torch(self.stability_index, copy=False)
+            stability = qd_to_torch(self.stability_index)
             if torch.any(~torch.isfinite(stability) | (stability > 1.0)):
                 gs.raise_exception(
                     "Hybrid attachment exceeds its supported local stability range for the current mass, inertia and "
@@ -297,7 +348,7 @@ class HybridBinding:
         kernel_apply_attachment(f, rigid.dyn_state.links, self)
         self.interval += self.part_soft.solver.substep_dt
 
-    def get_mass_breakdown(self):
+    def get_mass_breakdown(self) -> HybridMassBreakdown:
         rigid = self.part_rigid
         masses = torch.broadcast_to(rigid.get_links_mass(), (rigid.scene._B, rigid.n_links))
         coms = rigid.get_links_pos(ref=gs.link_ref_frame.link_COM, relative=False)
@@ -322,25 +373,25 @@ class HybridBinding:
             tuple(link.name for link in rigid.links),
         )
 
-    def get_binding_diagnostics(self):
-        return {
-            "link_idx": self.links_idx_tensor.clone(),
-            "weights": self.weights_tensor.clone(),
-            "active_count": self.active_count_tensor.clone(),
-            "region_id": self.regions_tensor.clone(),
-            "region_names": list(self.region_names),
-            "material_id": self.particle_material_id_tensor.clone(),
-            "surface_contact": self.particle_surface_contact_tensor.clone(),
-            "particle_mass": self.particle_mass_tensor.clone(),
-            "attach_pos_err_max": qd_to_torch(self.position_error_max, copy=True),
-            "attach_impulse_sum": qd_to_torch(self.particle_impulse, copy=True),
-            "attach_ang_impulse_sum": qd_to_torch(self.particle_angular_impulse, copy=True),
-            "damping_work": qd_to_torch(self.damping_work, copy=True),
-            "spring_potential": qd_to_torch(self.spring_potential, copy=True),
-            "stability_index": qd_to_torch(self.stability_index, copy=True),
-        }
+    def get_binding_diagnostics(self) -> HybridBindingDiagnostics:
+        return HybridBindingDiagnostics(
+            link_idx=self.links_idx_tensor.clone(),
+            weights=self.weights_tensor.clone(),
+            active_count=self.active_count_tensor.clone(),
+            region_id=self.regions_tensor.clone(),
+            region_names=tuple(self.region_names),
+            material_id=self.particle_material_id_tensor.clone(),
+            surface_contact=self.particle_surface_contact_tensor.clone(),
+            particle_mass=self.particle_mass_tensor.clone(),
+            attach_pos_err_max=qd_to_torch(self.position_error_max, copy=True),
+            attach_impulse_sum=qd_to_torch(self.particle_impulse, copy=True),
+            attach_ang_impulse_sum=qd_to_torch(self.particle_angular_impulse, copy=True),
+            damping_work=qd_to_torch(self.damping_work, copy=True),
+            spring_potential=qd_to_torch(self.spring_potential, copy=True),
+            stability_index=qd_to_torch(self.stability_index, copy=True),
+        )
 
-    def get_attachment_link_wrench(self):
+    def get_attachment_link_wrench(self) -> tuple[torch.Tensor, torch.Tensor]:
         interval = self.interval.clamp_min(torch.finfo(gs.tc_float).tiny)[:, None, None]
         return (
             qd_to_torch(self.link_impulse, transpose=True, copy=True) / interval,

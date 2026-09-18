@@ -1,3 +1,4 @@
+from math import isclose
 from typing import Any, Literal
 
 from pydantic import StrictBool, model_validator
@@ -14,7 +15,13 @@ class HybridSkinOptions(Options):
 
     ``surface`` accepts a mesh path or ``trimesh.Trimesh`` in the entity frame. Its vertices must form a watertight,
     consistently wound solid. ``reference_pos`` and ``reference_quat`` place that mesh within the entity before the
-    morph transform. ``from_urdf_geoms`` instead samples the signed-distance union of every collision geometry.
+    morph transform. ``from_urdf_geoms`` instead samples the signed-distance union of every collision geometry and
+    requires an identity reference transform. Position generated skins through the URDF morph or its collision geometry.
+
+    ``urdf_inflate`` expands the generated union in meters (default 0.02). Larger values cover more of the skeleton and
+    increase skin volume. ``voxel_pitch`` sets its sampling resolution in meters. Smaller values improve geometric
+    detail at greater preprocessing time and memory cost. If None, it uses the MPM particle size. Both settings apply
+    to generated skins. A supplied ``surface`` requires the default ``urdf_inflate`` and ``voxel_pitch=None``.
 
     ``skinning`` accepts an NPZ path or a mapping with ``link_names``, integer ``indices[V, K]`` and nonnegative
     ``weights[V, K]``. Index -1 denotes an unused slot. Closest-triangle barycentric interpolation transfers weights
@@ -32,8 +39,6 @@ class HybridSkinOptions(Options):
 
     surface: Any = None
     from_urdf_geoms: StrictBool = False
-    volume_mode: Literal["solid", "shell"] = "solid"
-    shell_thickness: PositiveFloat = 0.02
     skinning: Any = None
     regions: Any = None
     vertex_material_id: Any = None
@@ -49,13 +54,23 @@ class HybridSkinOptions(Options):
     def _validate_source(self) -> Self:
         if (self.surface is None) != self.from_urdf_geoms:
             gs.raise_exception("Hybrid skin requires exactly one source: surface or from_urdf_geoms=True.")
-        if self.volume_mode != "solid":
-            gs.raise_exception("Hybrid volume sampling supports solid surfaces. Shell volume sampling is unavailable.")
         if self.from_urdf_geoms and any(
             value is not None
             for value in (self.skinning, self.regions, self.vertex_material_id, self.vertex_surface_contact)
         ):
             gs.raise_exception("Generated URDF union vertices require generated bindings and regions.")
+        if self.from_urdf_geoms:
+            if any(not isclose(value, 0.0, rel_tol=0.0, abs_tol=0.0) for value in self.reference_pos):
+                gs.raise_exception("Hybrid skin reference_pos requires a supplied surface. Position the URDF morph.")
+            if any(not isclose(value, 0.0, rel_tol=0.0, abs_tol=0.0) for value in self.reference_quat[1:]):
+                gs.raise_exception("Hybrid skin reference_quat requires a supplied surface. Rotate the URDF morph.")
+        else:
+            if not isclose(
+                self.urdf_inflate, type(self).model_fields["urdf_inflate"].default, rel_tol=0.0, abs_tol=0.0
+            ):
+                gs.raise_exception("Hybrid skin urdf_inflate requires from_urdf_geoms=True. Edit the supplied surface.")
+            if self.voxel_pitch is not None:
+                gs.raise_exception("Hybrid skin voxel_pitch requires from_urdf_geoms=True.")
         return self
 
 
@@ -78,7 +93,6 @@ class HybridBindingOptions(Options):
     spring work and total angular momentum when skin blends across independently rotating links.
     """
 
-    method: Literal["linear_blend"] = "linear_blend"
     max_influences: PositiveInt = 4
     timeconst: PositiveFloat = 0.01
     damping_ratio: NonNegativeFloat = 1.0

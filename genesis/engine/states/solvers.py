@@ -8,6 +8,13 @@ import genesis as gs
 from genesis.repr_base import RBC
 from genesis.utils.array_class import DataKind
 
+from .contacts import ContactObservationState
+
+
+# State schema 1 applies the material's coupling friction directly. Schema 2 records its per-geom, per-environment
+# scale explicitly. The trajectory container and array layouts continue to use GSTRAJ1.
+STATE_SCHEMA_VERSION = 2
+
 
 @dataclasses.dataclass
 class SolverCheckpoint:
@@ -83,6 +90,7 @@ class SimState(RBC):
         self._solvers_state = list()
         for solver in solvers:
             self._solvers_state.append(solver.get_state(f_local))
+        self._contact_state = scene.sim.get_contact_state()
 
     @property
     def scene(self):
@@ -100,6 +108,11 @@ class SimState(RBC):
     def sensor_state(self):
         """Owned electronics and sensor histories; future random draws use the caller-controlled torch RNG."""
         return self._sensor_state
+
+    @property
+    def contact_state(self) -> ContactObservationState:
+        """Owned contact accumulators and hybrid attachment diagnostics on the simulation device."""
+        return self._contact_state
 
     def __iter__(self):
         return iter(self._solvers_state)
@@ -155,6 +168,7 @@ class RigidSolverState:
         self.links_pos = gs.zeros((_B, scene.sim.rigid_solver.n_links, 3), **args)
         self.links_quat = gs.zeros((_B, scene.sim.rigid_solver.n_links, 4), **args)
         self.friction_ratio = gs.ones((_B, scene.sim.rigid_solver.n_geoms), **args)
+        self.coup_friction_scale = gs.ones((_B, scene.sim.rigid_solver.n_geoms), **args)
 
     @property
     def s_global(self):

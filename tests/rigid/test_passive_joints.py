@@ -104,7 +104,8 @@ def test_passive_actuator_coexistence(independent_scalar_joints, show_viewer, jo
 
 
 @pytest.mark.required
-def test_coupled_limit_potentials(independent_scalar_joints, show_viewer, tmp_path):
+@pytest.mark.parametrize("force_limit", [np.inf, 0.5])
+def test_coupled_limit_potentials(independent_scalar_joints, show_viewer, tmp_path, force_limit):
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=0.0001,
@@ -124,6 +125,7 @@ def test_coupled_limit_potentials(independent_scalar_joints, show_viewer, tmp_pa
     model.add_coupled_limit_group([0, 1], name="ellipse")
     model.add_coupled_limit_group([0, 1], kind="polytope", name="faces", n_faces=3)
     scene.build(n_envs=4)
+    model.set_params(force_limit=force_limit)
     center = np.array([0.1, -0.1])
     radii_pos = np.array([[0.5, 1], [0.25, 2], [2, 0.5], [1, 2]])
     radii_neg = np.array([1, 0.5])
@@ -149,6 +151,8 @@ def test_coupled_limit_potentials(independent_scalar_joints, show_viewer, tmp_pa
         displacement[:, i] = 1e-5
         gradient[:, i] = (potential(position + displacement) - potential(position - displacement)) / 2e-5
     assert_allclose(model.get_coupled_limit_dofs_force(), -gradient, atol=2e-5)
+    applied_force = np.clip(-gradient, -force_limit, force_limit)
+    assert_allclose(model.get_applied_dofs_force(), applied_force, atol=2e-5)
     assert_allclose(entity.get_potential_energy(), potential(position), atol=2e-5)
     radii = np.where(position >= center, radii_pos, radii_neg)
     violations = np.stack(
@@ -168,10 +172,10 @@ def test_coupled_limit_potentials(independent_scalar_joints, show_viewer, tmp_pa
     checkpoint_path = tmp_path / "passive.gstraj"
     scene.save_checkpoint(checkpoint_path)
     scene.step()
-    assert_allclose(entity.get_dofs_velocity(), 0.0001 * (0.3 - gradient) / 0.1, atol=2e-6)
+    assert_allclose(entity.get_dofs_velocity(), 0.0001 * (0.3 + applied_force) / 0.1, atol=2e-6)
     restored = gs.Scene.load_checkpoint(checkpoint_path, show_viewer=show_viewer)
     restored.step()
-    assert_allclose(restored.entities[0].get_dofs_velocity(), 0.0001 * (0.3 - gradient) / 0.1, atol=2e-6)
+    assert_allclose(restored.entities[0].get_dofs_velocity(), 0.0001 * (0.3 + applied_force) / 0.1, atol=2e-6)
     restored.entities[0].passive_joint_models[0].set_coupled_limit_params("ellipse", k=0, envs_idx=[0])
 
 

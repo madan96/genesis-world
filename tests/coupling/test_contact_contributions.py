@@ -15,12 +15,25 @@ def test_rigid_contact_wrench(n_envs, show_viewer):
     POSITION = (0.3, 0.2, 0.1)
     REFERENCE = (0.1, -0.2, 0.0)
     scene = gs.Scene(
-        sim_options=gs.options.SimOptions(dt=DT, substeps=2, gravity=(0, 0, -GRAVITY)),
+        sim_options=gs.options.SimOptions(
+            dt=DT,
+            substeps=2,
+            gravity=(0, 0, -GRAVITY),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(1.0, -1.0, 0.8),
+            camera_lookat=POSITION,
+        ),
         show_viewer=show_viewer,
     )
-    floor = scene.add_entity(morph=gs.morphs.Plane())
+    floor = scene.add_entity(
+        morph=gs.morphs.Plane(),
+    )
     box = scene.add_entity(
-        morph=gs.morphs.Box(size=(0.2, 0.2, 0.2), pos=POSITION),
+        morph=gs.morphs.Box(
+            size=(0.2, 0.2, 0.2),
+            pos=POSITION,
+        ),
         material=gs.materials.Rigid(rho=MASS / 0.2**3),
     )
     scene.build(n_envs=n_envs)
@@ -66,13 +79,29 @@ def test_rigid_contact_wrench(n_envs, show_viewer):
     assert_equal(rows.force, snapshot)
     rows.force.zero_()
     assert_allclose(box.get_links_contact_wrench(source="rigid").force, (0, 0, MASS * GRAVITY), atol=0.01)
+    scene_snapshot = scene.get_state()
+    if n_envs:
+        scene.reset(envs_idx=[1])
     before_reset = scene.get_contact_contributions(source="rigid")
+    expected_net_force = box.get_links_net_contact_force()
     scene.reset(envs_idx=[0] if n_envs else None)
     after_reset = scene.get_contact_contributions(source="rigid")
     assert_equal(after_reset.count[0], 0)
     if n_envs:
         assert_equal(after_reset.count[1], before_reset.count[1])
         assert_equal(after_reset.force[1], before_reset.force[1])
+
+    for selection in ([0], torch.tensor([True, False], device=gs.device)) if n_envs else (None,):
+        scene.reset(scene_snapshot, envs_idx=selection)
+        restored = scene.get_contact_contributions(source="rigid")
+        for name, value in vars(before_reset).items():
+            assert_allclose(vars(restored)[name], value, atol=1e-8)
+        assert_allclose(box.get_links_net_contact_force(), expected_net_force, atol=1e-8)
+        scene.reset(envs_idx=selection)
+        assert_equal(scene.get_contact_contributions(source="rigid").count[0], 0)
+    scene.reset(scene_snapshot)
+    scene.step()
+    assert_allclose(box.get_links_contact_wrench(source="rigid").force, (0, 0, MASS * GRAVITY), atol=0.01)
 
 
 @pytest.mark.required
@@ -83,22 +112,38 @@ def test_mpm_contact_wrench(n_envs, substeps, capacity, show_viewer):
     DT = substeps * 2e-4
     REFERENCE = (0.02, -0.03, 0.0)
     scene = gs.Scene(
-        sim_options=gs.options.SimOptions(dt=DT, substeps=substeps, gravity=(0, 0, 0)),
+        sim_options=gs.options.SimOptions(
+            dt=DT,
+            substeps=substeps,
+            gravity=(0, 0, 0),
+        ),
         mpm_options=gs.options.MPMOptions(
             lower_bound=(-0.25, -0.25, -0.25),
             upper_bound=(0.375, 0.375, 0.375),
             grid_density=64,
             particle_size=0.0078125,
         ),
-        coupler_options=gs.options.LegacyCouplerOptions(contact_buffer_capacity=capacity),
+        coupler_options=gs.options.LegacyCouplerOptions(
+            contact_buffer_capacity=capacity,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.4, 0.3, 0.2),
+            camera_lookat=(0.125, 0.0625, 0.01),
+        ),
         show_viewer=show_viewer,
     )
     soft = scene.add_entity(
-        morph=gs.morphs.Box(size=(0.03125, 0.03125, 0.03125), pos=(0.125, 0.0625, 0.01)),
+        morph=gs.morphs.Box(
+            size=(0.03125, 0.03125, 0.03125),
+            pos=(0.125, 0.0625, 0.01),
+        ),
         # Symmetric sampling makes the expected contact moment independent of grid interpolation.
         material=gs.materials.MPM.Elastic(E=1000, rho=1000, sampler="regular"),
     )
-    floor = scene.add_entity(morph=gs.morphs.Plane(), material=gs.materials.Rigid(coup_friction=0))
+    floor = scene.add_entity(
+        morph=gs.morphs.Plane(),
+        material=gs.materials.Rigid(coup_friction=0),
+    )
     scene.build(n_envs=n_envs)
     soft.set_particles_vel((0, 0, -1))
     mass = soft.get_mass()
@@ -149,6 +194,18 @@ def test_mpm_contact_wrench(n_envs, substeps, capacity, show_viewer):
         assert_allclose(rows.area.sum(dim=1), wrench.area[:, 0], atol=1e-7)
 
     saved_force = rows.force.clone()
+    scene_snapshot = scene.get_state()
+    scene.step()
+    continued_pos = soft.get_particles_pos().clone()
+    continued_impulse = scene.get_links_contact_wrench(source="hybrid").impulse
+    scene.reset(scene_snapshot)
+    restored = scene.get_contact_contributions(source="hybrid")
+    for name, value in vars(rows).items():
+        assert_equal(vars(restored)[name], value)
+    if n_envs:
+        scene.reset(envs_idx=[1])
+    expected_rows = scene.get_contact_contributions(source="hybrid")
+    expected_wrench = scene.get_links_contact_wrench(source="hybrid")
     scene.reset(envs_idx=[0] if n_envs else None)
     reset_rows = scene.get_contact_contributions(source="hybrid")
     reset_wrench = scene.get_links_contact_wrench(source="hybrid")
@@ -157,12 +214,26 @@ def test_mpm_contact_wrench(n_envs, substeps, capacity, show_viewer):
     assert_equal(reset_wrench.hybrid_interval[0], 0)
     assert_equal(reset_wrench.impulse[0], 0)
     if n_envs:
-        assert_equal(reset_rows.force[1], rows.force[1])
-        assert_equal(reset_rows.dropped_count[1], rows.dropped_count[1])
-        assert_equal(reset_wrench.impulse[1], wrench.impulse[1])
+        assert_equal(reset_rows.force[1], expected_rows.force[1])
+        assert_equal(reset_rows.dropped_count[1], expected_rows.dropped_count[1])
+        assert_equal(reset_wrench.impulse[1], expected_wrench.impulse[1])
+    for selection in ([0], torch.tensor([True, False], device=gs.device)) if n_envs else (None,):
+        scene.reset(scene_snapshot, envs_idx=selection)
+        restored = scene.get_contact_contributions(source="hybrid")
+        restored_wrench = scene.get_links_contact_wrench(source="hybrid")
+        for name, value in vars(expected_rows).items():
+            assert_equal(vars(restored)[name], value)
+        for name, value in vars(expected_wrench).items():
+            assert_equal(vars(restored_wrench)[name], value)
+        scene.reset(envs_idx=selection)
     assert_equal(rows.force, saved_force)
     rows.force.zero_()
     assert_equal(scene.get_contact_contributions(source="hybrid").force, reset_rows.force)
+
+    scene.reset(scene_snapshot)
+    scene.step()
+    assert_allclose(soft.get_particles_pos(), continued_pos, atol=1e-8)
+    assert_allclose(scene.get_links_contact_wrench(source="hybrid").impulse, continued_impulse, atol=1e-8)
 
     soft.set_particles_active(False)
     scene.step()
@@ -173,36 +244,85 @@ def test_mpm_contact_wrench(n_envs, substeps, capacity, show_viewer):
 
 
 @pytest.mark.required
-def test_mpm_sliding_friction_scaling(show_viewer):
+@pytest.mark.parametrize("n_envs", [0, 2])
+def test_mpm_sliding_friction_scaling(n_envs, show_viewer):
     scene = gs.Scene(
-        sim_options=gs.options.SimOptions(dt=0.0002, gravity=(0, 0, 0)),
+        sim_options=gs.options.SimOptions(
+            dt=0.0002,
+            gravity=(0, 0, 0),
+        ),
         mpm_options=gs.options.MPMOptions(
             lower_bound=(-0.25, -0.25, -0.25),
             upper_bound=(0.375, 0.375, 0.375),
             grid_density=64,
             particle_size=0.0078125,
         ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.4, 0.3, 0.2),
+            camera_lookat=(0.125, 0.0625, 0.01),
+        ),
         show_viewer=show_viewer,
     )
     soft = scene.add_entity(
-        gs.morphs.Box(size=(0.03125, 0.03125, 0.03125), pos=(0.125, 0.0625, 0.01)),
+        morph=gs.morphs.Box(
+            size=(0.03125, 0.03125, 0.03125),
+            pos=(0.125, 0.0625, 0.01),
+        ),
         material=gs.materials.MPM.Elastic(E=1000, rho=1000, sampler="regular"),
     )
-    floor = scene.add_entity(gs.morphs.Plane(), material=gs.materials.Rigid(coup_friction=0.5))
-    scene.build(n_envs=2)
-    scene.sim.coupler.set_coup_friction_scale(((0,), (1,)), geoms_idx=[floor.geom_start])
+    floor = scene.add_entity(
+        morph=gs.morphs.Plane(),
+        material=gs.materials.Rigid(coup_friction=0.5),
+    )
+    scene.build(n_envs=n_envs)
+    initial_state = scene.get_state()
+    floor.set_coup_friction_scale(((0,), (1,)) if n_envs else 0.25)
+    saved_scale = floor.get_coup_friction_scale()
+    snapshot = scene.get_state()
     soft.set_particles_vel((1, 0, -1))
-    before = soft.get_particles_vel().mean(dim=1)
+    before = soft.get_particles_vel().mean(dim=-2)
     scene.step()
     wrench = floor.get_links_contact_wrench(source="hybrid")
-    expected = soft.get_mass()[:, None] * (before - soft.get_particles_vel().mean(dim=1))
+    expected = soft.get_mass()[..., None] * (before - soft.get_particles_vel().mean(dim=-2))
     assert_allclose(wrench.impulse[:, 0], expected, atol=1e-7)
     assert (wrench.impulse[:, 0, 2] < -1e-5).all()
-    assert_allclose(wrench.impulse[:, 0, 0] / -wrench.impulse[:, 0, 2], (0, 0.5), atol=1e-5)
+    assert_allclose(wrench.impulse[:, 0, 0] / -wrench.impulse[:, 0, 2], (0, 0.5) if n_envs else 0.125, atol=1e-5)
 
     scene.reset()
-    scene.sim.coupler.set_coup_friction_scale(0.5, geoms_idx=[floor.geom_start], envs_idx=[0])
-    soft.set_particles_vel((1, 0, -1))
-    scene.step()
-    wrench = floor.get_links_contact_wrench(source="hybrid")
-    assert_allclose(wrench.impulse[:, 0, 0] / -wrench.impulse[:, 0, 2], (0.25, 0.5), atol=1e-5)
+    assert_equal(floor.get_coup_friction_scale(), 1)
+    selections = ([0], torch.tensor([True, False], device=gs.device)) if n_envs else (None,)
+    for selection in selections:
+        scene.reset(initial_state)
+        assert_equal(floor.get_coup_friction_scale(), 1)
+        floor.set_coup_friction_scale(0.5)
+        scene.reset(snapshot, envs_idx=selection)
+        soft.set_particles_vel((1, 0, -1))
+        scene.step()
+        wrench = floor.get_links_contact_wrench(source="hybrid")
+        assert_allclose(wrench.impulse[:, 0, 0] / -wrench.impulse[:, 0, 2], (0, 0.25) if n_envs else 0.125, atol=1e-5)
+        assert_equal(floor.get_coup_friction_scale(), ((0,), (0.5,)) if n_envs else 0.25)
+    assert_equal(saved_scale, ((0,), (1,)) if n_envs else 0.25)
+    saved_scale.zero_()
+    assert_equal(floor.get_coup_friction_scale(), ((0,), (0.5,)) if n_envs else 0.25)
+    for selection in selections:
+        floor.set_coup_friction_scale(0.125, envs_idx=selection)
+        assert_equal(floor.get_coup_friction_scale(), ((0.125,), (0.5,)) if n_envs else 0.125)
+    if n_envs:
+        floor.set_coup_friction_scale(((0.25,), (0.75,)), envs_idx=[1, 0])
+        assert_equal(floor.get_coup_friction_scale(), ((0.75,), (0.25,)))
+        assert_equal(floor.get_coup_friction_scale(envs_idx=[1, 0]), ((0.25,), (0.75,)))
+        floor.set_coup_friction_scale(0.5, envs_idx=-1)
+        assert_equal(floor.get_coup_friction_scale(), ((0.75,), (0.5,)))
+        floor.set_coup_friction_scale(0.125, envs_idx=range(-n_envs, 0))
+        assert_equal(floor.get_coup_friction_scale(), 0.125)
+        floor.set_coup_friction_scale(((0.25,), (0.75,)), envs_idx=range(n_envs - 1, -1, -1))
+        assert_equal(floor.get_coup_friction_scale(), ((0.75,), (0.25,)))
+        floor.set_coup_friction_scale(((0.5,), (0.125,)), envs_idx=slice(None, None, -1))
+        assert_equal(floor.get_coup_friction_scale(), ((0.125,), (0.5,)))
+    for value in (-1.0, float("nan"), float("inf")):
+        with pytest.raises(gs.GenesisException, match="finite and nonnegative"):
+            floor.set_coup_friction_scale(value)
+    with pytest.raises(gs.GenesisException):
+        floor.set_coup_friction_scale(1, geoms_idx_local=[floor.n_geoms])
+    with pytest.raises(gs.GenesisException):
+        floor.set_coup_friction_scale(1, envs_idx=n_envs)

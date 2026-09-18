@@ -9,7 +9,7 @@ import sys
 import weakref
 import zipfile
 from collections import Counter
-from typing import BinaryIO, Callable, Iterable, Literal, NamedTuple, TYPE_CHECKING, overload
+from typing import TYPE_CHECKING, BinaryIO, Callable, Iterable, Literal, NamedTuple, overload
 
 import numpy as np
 import torch
@@ -19,14 +19,13 @@ import trimesh
 import genesis as gs
 import genesis.utils.geom as gu
 import genesis.utils.mesh as mu
-from genesis.engine.entities.base_entity import Entity, EntityDescription
 from genesis.engine.contact_contributions import ContactContributions, ContactLinkWrenches, ContactReader, ContactSource
+from genesis.engine.entities.base_entity import Entity, EntityDescription
 from genesis.engine.entities.rigid_entity import KinematicEntity
 from genesis.engine.force_fields import ForceField
 from genesis.engine.materials.base import EntityT, Material
-from genesis.engine.states.solvers import SimState, SimulatorCheckpoint
+from genesis.engine.states.solvers import STATE_SCHEMA_VERSION, SimState, SimulatorCheckpoint
 from genesis.options import (
-    SceneOptions,
     BaseCouplerOptions,
     FEMOptions,
     KinematicOptions,
@@ -35,8 +34,9 @@ from genesis.options import (
     ProfilingOptions,
     RigidOptions,
     SFOptions,
-    SimOptions,
     SPHOptions,
+    SceneOptions,
+    SimOptions,
     ToolOptions,
     ViewerOptions,
     VisOptions,
@@ -91,12 +91,17 @@ class EnvironmentLayout:
 
 @dataclasses.dataclass
 class SceneCheckpoint:
-    """The checkpoint of a built scene, which 'Scene.__getstate__' returns and a pickled scene serializes."""
+    """The checkpoint of a built scene, which 'Scene.__getstate__' returns and a pickled scene serializes.
+
+    The class default identifies schema 1 pickles, whose instance dictionaries lack a schema marker. Current writers
+    provide STATE_SCHEMA_VERSION explicitly.
+    """
 
     scene: SceneDescription
     digest: str
     layout: EnvironmentLayout
     sim: SimulatorCheckpoint
+    state_schema_version: int = 1
 
 
 class TrajectorySource(NamedTuple):
@@ -974,9 +979,10 @@ class Scene(RBC):
         state : SimState | None
             The state to reset the scene to. If None, the scene will be reset to its initial state.
             If this is given, the scene's registerered initial state will be updated to this state.
-            An explicit state restores captured sensor histories and electronics for the selected environments.
-            With None, sensor histories clear and configured hardware randomization is resampled. Future random
-            draws use the caller-controlled torch RNG; restoring a state does not rewind that shared RNG.
+            An explicit state restores contact observations, attachment diagnostics, sensor histories and electronics
+            for the selected environments. With None, contact observations and sensor histories clear and configured
+            hardware randomization is resampled. Future random draws use the caller-controlled torch RNG; restoring a
+            state does not rewind that shared RNG.
         envs_idx : None | array_like, optional
             The indices of the environments. If None, all environments will be considered. Defaults to None.
         """
@@ -990,7 +996,7 @@ class Scene(RBC):
 
     def _reset(self, state: SimState | None = None, *, envs_idx=None, keep_init: bool = False):
         if self._is_built:
-            restore_sensor_state = state is not None
+            restore_observation_state = state is not None
             if state is None:
                 state = self._init_state
             else:
@@ -999,7 +1005,7 @@ class Scene(RBC):
                 # reset() still rewinds to the true initial state.
                 if not keep_init:
                     self._init_state = state
-            self._sim.reset(state, envs_idx, restore_sensor_state=restore_sensor_state)
+            self._sim.reset(state, envs_idx, restore_observation_state=restore_observation_state)
         else:
             self._init_state = self._get_state()
         self._restart()
@@ -1697,7 +1703,11 @@ class Scene(RBC):
         """
         self._reject_unexportable()
         return SceneCheckpoint(
-            scene=self.desc, digest=self._desc_digest, layout=self._layout, sim=self._sim.__getstate__()
+            scene=self.desc,
+            digest=self._desc_digest,
+            layout=self._layout,
+            sim=self._sim.__getstate__(),
+            state_schema_version=STATE_SCHEMA_VERSION,
         )
 
     def __reduce__(self):
@@ -1812,6 +1822,8 @@ class Scene(RBC):
         state : SceneCheckpoint
             The state to put back, as read by '__getstate__' or cut from a trajectory frame.
         """
+        if type(state.state_schema_version) is not int or state.state_schema_version not in (1, STATE_SCHEMA_VERSION):
+            gs.raise_exception(f"The checkpoint holds unsupported state schema version {state.state_schema_version!r}.")
         if state.layout != self._layout:
             gs.raise_exception(
                 f"The state was read from a scene built with {state.layout} and this one was built with {self._layout}."
@@ -1825,6 +1837,27 @@ class Scene(RBC):
             gs.raise_exception(
                 f"The checkpoint holds {sorted(state.sim.solvers)} where this scene simulates {sorted(solvers)}."
             )
+        if state.state_schema_version == 1 and "RigidSolver" in state.sim.solvers:
+            rigid = state.sim.solvers["RigidSolver"]
+            if (
+                "dyn_state.geoms.coup_friction_scale" not in rigid.arrays
+                and "dyn_state.geoms.friction_ratio" in rigid.arrays
+            ):
+                # Apply the schema 1 material convention (see STATE_SCHEMA_VERSION) to an owned record.
+                friction_ratio = rigid.arrays["dyn_state.geoms.friction_ratio"]
+                scale = (
+                    torch.ones_like(friction_ratio)
+                    if isinstance(friction_ratio, torch.Tensor)
+                    else np.ones_like(friction_ratio)
+                )
+                rigid = dataclasses.replace(
+                    rigid, arrays={**rigid.arrays, "dyn_state.geoms.coup_friction_scale": scale}
+                )
+                state = dataclasses.replace(
+                    state,
+                    sim=dataclasses.replace(state.sim, solvers={**state.sim.solvers, "RigidSolver": rigid}),
+                    state_schema_version=STATE_SCHEMA_VERSION,
+                )
         for name, solver in solvers.items():
             record = state.sim.solvers[name]
             check_data((item for item in solver.data if item.kind in record.kinds), record.arrays)

@@ -1,14 +1,15 @@
 import platform
 import re
 import sys
-from typing import TYPE_CHECKING, Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any
 
-import quadrants as qd
 from pydantic import BeforeValidator, Field, PrivateAttr
 from pydantic_core import PydanticCustomError
 
+import quadrants as qd
+
 import genesis as gs
-from genesis.typing import PositiveFloat, StrictInt, ValidFloat
+from genesis.typing import NonNegativeFloat, PositiveFloat, StrictInt, ValidFloat
 
 from ..base import Material
 
@@ -53,6 +54,10 @@ class Base(Material["MPMEntity"]):
         The first Lame's parameter. Default is None, computed from E and nu.
     mu : float, optional
         The second Lame's parameter. Default is None, computed from E and nu.
+    friction : float, optional
+        Dimensionless sliding friction coefficient for contact with other MPM surfaces. The coefficient of a pair is
+        the geometric mean of the two surface values. Zero gives frictionless sliding. Defaults to 1.0. Contact with
+        rigid bodies uses their material's coup_friction instead.
     sampler : str, optional
         Particle sampler ('pbs', 'regular', 'random'). Default is platform-dependent.
     """
@@ -62,6 +67,7 @@ class Base(Material["MPMEntity"]):
     rho: PositiveFloat = 1000.0
     lam: ValidFloat | None = None
     mu: ValidFloat | None = None
+    friction: NonNegativeFloat = 1.0
     sampler: SamplerType = DEFAULT_SAMPLER
 
     # Dispatch fields - set by subclass model_post_init, not user-specified. needs_svd flips the solver's forward-mode

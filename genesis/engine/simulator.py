@@ -26,6 +26,7 @@ from .solvers import (
 )
 from .solvers.base_solver import GravityMixin, TimeBasedMixin
 from .states.cache import QueriedStates
+from .states.contacts import ContactObservationState
 from .states.solvers import SimState, SimulatorCheckpoint
 
 if TYPE_CHECKING:
@@ -244,7 +245,7 @@ class Simulator(RBC):
     def destroy(self):
         self._sensor_manager.destroy()
 
-    def reset(self, state: SimState, envs_idx=None, *, restore_sensor_state: bool = True):
+    def reset(self, state: SimState, envs_idx=None, *, restore_observation_state: bool = True):
         for solver, solver_state in zip(self._solvers, state):
             if solver.n_entities > 0:
                 solver.set_state(0, solver_state, envs_idx)
@@ -253,13 +254,25 @@ class Simulator(RBC):
             self._steps.zero_()
         else:
             self._steps[indices_to_mask(envs_idx)] = 0
-        self._restart(envs_idx, sensor_state=state.sensor_state if restore_sensor_state else None)
+        self._restart(
+            envs_idx,
+            sensor_state=state.sensor_state if restore_observation_state else None,
+            contact_state=state.contact_state if restore_observation_state else None,
+        )
 
-    def _restart(self, envs_idx=None, *, sensor_state=None):
+    def _restart(self, envs_idx=None, *, sensor_state=None, contact_state: ContactObservationState | None = None):
         """Restart the coupler, the gradient tape and the sensors."""
         self._coupler.reset(envs_idx=envs_idx)
         for binding in self.mpm_solver._hybrid_bindings:
             binding.reset(self.scene._sanitize_envs_idx(envs_idx))
+
+        if contact_state is not None:
+            if contact_state.rigid is not None:
+                self.rigid_solver.collider.set_observation_state(contact_state.rigid, envs_idx)
+            if isinstance(self._coupler, LegacyCoupler) and contact_state.mpm is not None:
+                self._coupler.contact_telemetry.set_state(contact_state.mpm, envs_idx)
+            for binding, binding_state in zip(self.mpm_solver._hybrid_bindings, contact_state.attachments):
+                binding.set_observation_state(binding_state, envs_idx)
 
         # TODO: keeping as is for now
         self.reset_grad()
@@ -500,6 +513,16 @@ class Simulator(RBC):
     # ------------------------------------------------------------------------------------
     # --------------------------------------- io -----------------------------------------
     # ------------------------------------------------------------------------------------
+
+    def get_contact_state(self) -> ContactObservationState:
+        """Capture owned contact observations independently of solver dynamics and sensor electronics."""
+        return ContactObservationState(
+            self.rigid_solver.collider.get_observation_state() if self.rigid_solver.is_active else None,
+            self._coupler.contact_telemetry.get_state()
+            if isinstance(self._coupler, LegacyCoupler) and self._coupler.contact_telemetry is not None
+            else None,
+            tuple(binding.get_observation_state() for binding in self.mpm_solver._hybrid_bindings),
+        )
 
     def get_state(self):
         state = SimState(

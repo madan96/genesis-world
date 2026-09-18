@@ -3,9 +3,42 @@ import pytest
 import trimesh
 
 import genesis as gs
+from genesis.utils import geom as gu
 from genesis.utils import hybrid_skin
 
 from ..utils.assertions import assert_allclose, assert_equal
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("is_transformed", [False, True])
+def test_collision_union_volume(skin_collision_union, show_viewer, is_transformed):
+    PITCH = 0.002
+    position = np.array([0.3, -0.2, 0.5]) if is_transformed else np.zeros(3)
+    quaternion = gu.xyz_to_quat(np.array([0.0, 0.0, np.pi / 2 if is_transformed else 0.0]))
+    scene = gs.Scene(
+        show_viewer=show_viewer,
+    )
+    entity = scene.add_entity(
+        morph=gs.morphs.URDF(
+            file=skin_collision_union,
+            pos=position,
+            quat=quaternion,
+            fixed=True,
+        ),
+    )
+    poses = hybrid_skin.reference_link_poses(entity.links)
+    surface = hybrid_skin.build_urdf_union_surface(entity, poses, pitch=PITCH, inflate=0.0)
+    hybrid_skin.validate_solid_surface(surface)
+    # The union is a 0.12 x 0.08 x 0.08 cuboid plus a separate 0.08 m cube. Edge cells bound voxelization error
+    assert_allclose(surface.volume, (0.12 + 0.08) * 0.08**2, atol=2e-5)
+    vertices_local = gu.inv_transform_by_trans_quat(surface.vertices, position, quaternion)
+    assert_allclose(vertices_local.min(axis=0), (-0.06, -0.04, -0.04), atol=PITCH)
+    assert_allclose(vertices_local.max(axis=0), (0.24, 0.04, 0.04), atol=PITCH)
+    assert_allclose(
+        poses[entity.links[1].idx][0],
+        gu.transform_by_trans_quat(np.array([0.2, 0, 0]), position, quaternion),
+        atol=1e-14,
+    )
 
 
 @pytest.mark.required
@@ -65,6 +98,23 @@ def test_skinning_validation(defect):
         payload["weights"][0] = 0
     with pytest.raises(gs.GenesisException):
         hybrid_skin.load_skinning(payload, surface, {"base": 4, "tip": 9})
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("scale", [1e-300, 1.0, 1e308])
+def test_skinning_weight_scale(scale):
+    surface = trimesh.creation.box()
+    indices, weights = hybrid_skin.load_skinning(
+        {
+            "link_names": ["base", "tip"],
+            "indices": np.tile([0, 1], (len(surface.vertices), 1)),
+            "weights": np.tile([scale, scale], (len(surface.vertices), 1)),
+        },
+        surface,
+        {"base": 4, "tip": 9},
+    )
+    assert_equal(indices, (4, 9))
+    assert_allclose(weights, (0.5, 0.5), atol=1e-15)
 
 
 @pytest.mark.required

@@ -2457,6 +2457,7 @@ class GeomsState:
     max_buffer_idx: qd.Tensor
     is_hibernated: qd.Tensor = of_kind(DataKind.STATE)
     friction_ratio: qd.Tensor = of_kind(DataKind.INFO)
+    coup_friction_scale: qd.Tensor = of_kind(DataKind.INFO)
 
 
 def get_geoms_state(solver, is_active=True):
@@ -2473,6 +2474,7 @@ def get_geoms_state(solver, is_active=True):
         max_buffer_idx=V(dtype=gs.qd_int, shape=shape),
         is_hibernated=V(dtype=gs.qd_int, shape=shape),
         friction_ratio=V(dtype=gs.qd_float, shape=shape),
+        coup_friction_scale=V(dtype=gs.qd_float, shape=shape),
     )
 
 

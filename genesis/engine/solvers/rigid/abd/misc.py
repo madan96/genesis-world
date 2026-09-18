@@ -665,6 +665,7 @@ def kernel_init_geom_fields(
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_g, i_b in qd.ndrange(n_geoms, _B):
         dyn_state.geoms.friction_ratio[i_g, i_b] = 1.0
+        dyn_state.geoms.coup_friction_scale[i_g, i_b] = 1.0
 
 
 @qd.kernel(fastcache=True)

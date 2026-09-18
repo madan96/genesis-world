@@ -273,8 +273,9 @@ class PassiveJointModel:
 
         Ellipsoids use ``rho = norm((q - center) / radii)`` with sign-selected positive/negative radii and excess
         ``max(rho - 1, 0)``. Polytopes use excess ``max(faces_normal @ (q - center) - faces_offset, 0)`` for each face.
-        Every excess contributes potential ``k * excess**(exponent + 1) / (exponent + 1)`` and its negative gradient.
-        Group values are set after build with ``set_coupled_limit_params``. Multiple groups may share members.
+        Every excess contributes potential ``k * excess**(exponent + 1) / (exponent + 1)``. Its negative gradient
+        contributes to the model's force before the per-DOF ``force_limit`` clamp. Group values are set after build
+        with ``set_coupled_limit_params``. Multiple groups may share members.
         """
         if self._info is not None:
             gs.raise_exception("Declare coupled-limit groups before scene.build().")
@@ -364,10 +365,10 @@ class PassiveJointModel:
 
         Neutral torque is ``-k_neutral * (q - q_neutral)``. Soft-limit torque is a restoring power law outside
         ``[soft_lo, soft_hi]``. Damping is ``-damping * velocity`` and friction is
-        ``-friction * tanh(velocity / friction_vel_eps)``. The applied force is the sum of these terms clamped to
-        ``[-force_limit, force_limit]``. The raw terms stay readable through their getters, and a saturated DOF applies
-        a force of smaller magnitude than the gradient of ``get_potential_energy``. Stiffnesses, damping and friction
-        must be nonnegative, ``soft_exponent >= 1`` and ``force_limit >= 0`` (infinite by default). Values of None
+        ``-friction * tanh(velocity / friction_vel_eps)``. The applied force sums these terms and every coupled-limit
+        group's force, then clamps the total to ``[-force_limit, force_limit]`` per DOF. The raw terms stay readable
+        through their getters. ``get_potential_energy`` reports the unclamped elastic potential. Stiffnesses, damping
+        and friction must be nonnegative, ``soft_exponent >= 1`` and ``force_limit >= 0`` (infinite by default). Values of None
         retain the current parameter. Invalid updates leave every parameter unchanged. Coordinates use the units of
         their selected DOF, and forces use N*m or N accordingly.
         """

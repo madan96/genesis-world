@@ -7,44 +7,78 @@ import torch
 import trimesh
 
 import genesis as gs
+from genesis.utils import geom
 from genesis.utils.misc import tensor_to_array
 
-from ..utils.assertions import assert_allclose
+from ..utils.assertions import assert_allclose, assert_equal
 from ..utils.assets import get_hf_dataset
 
 
 @pytest.mark.required
 @pytest.mark.parametrize("n_envs", [0, 2])
 @pytest.mark.parametrize("heterogeneous", [False, True])
-def test_continuous_skin_binding(n_envs, heterogeneous, tmp_path, tol):
-    urdf = tmp_path / "articulation.urdf"
-    urdf.write_text("""<robot name="articulation">
-      <link name="base"><inertial><mass value="2"/><inertia ixx="0.1" iyy="0.1" izz="0.1" ixy="0" ixz="0" iyz="0"/></inertial>
-        <collision><geometry><box size="0.08 0.08 0.08"/></geometry></collision></link>
-      <link name="tip"><inertial><mass value="2"/><inertia ixx="0.1" iyy="0.1" izz="0.1" ixy="0" ixz="0" iyz="0"/></inertial>
-        <collision><geometry><box size="0.08 0.08 0.08"/></geometry></collision></link>
-      <joint name="hinge" type="revolute"><parent link="base"/><child link="tip"/><origin xyz="0.2 0 0"/>
-        <axis xyz="0 0 1"/><limit lower="-1" upper="1" effort="100" velocity="10"/></joint>
-    </robot>""")
+@pytest.mark.parametrize("phase", ["before_coupling", "after_coupling"])
+def test_continuous_skin_binding(n_envs, heterogeneous, phase, skin_articulation, show_viewer, tol):
     surface = trimesh.creation.box(extents=(0.3, 0.08, 0.08))
     surface.apply_translation((0.1, 0.0, 0.0))
+    for settings in (
+        {"reference_pos": (0.1, 0.0, 0.0)},
+        {"reference_quat": (0.0, 0.0, 0.0, 1.0)},
+    ):
+        with pytest.raises(gs.GenesisException, match="reference_"):
+            gs.options.HybridSkinOptions(from_urdf_geoms=True, **settings)
+    for settings in ({"urdf_inflate": 0.1}, {"voxel_pitch": 0.01}):
+        with pytest.raises(gs.GenesisException, match="from_urdf_geoms"):
+            gs.options.HybridSkinOptions(surface=surface, **settings)
+    for name, value in (("damping", 1.0), ("thickness", 0.1), ("soft_dv_coef", 0.5)):
+        with pytest.raises(gs.GenesisException, match=name):
+            gs.materials.Hybrid(
+                material_rigid=gs.materials.Rigid(),
+                material_soft=gs.materials.MPM.Elastic(),
+                skin=gs.options.HybridSkinOptions(surface=surface),
+                **{name: value},
+            )
     scene = gs.Scene(
-        sim_options=gs.options.SimOptions(dt=1e-4, substeps=1, gravity=(0.0, 0.0, 0.0)),
-        rigid_options=gs.options.RigidOptions(integrator=gs.integrator.Euler),
+        sim_options=gs.options.SimOptions(
+            dt=1e-4,
+            gravity=(0.0, 0.0, 0.0),
+        ),
+        rigid_options=gs.options.RigidOptions(
+            integrator=gs.integrator.Euler,
+        ),
         mpm_options=gs.options.MPMOptions(
             lower_bound=(-0.5, -0.5, -0.5),
             upper_bound=(0.5, 0.5, 0.5),
             grid_density=32,
             particle_size=0.02,
         ),
-        show_viewer=False,
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.45, -0.6, 0.4),
+            camera_lookat=(0.1, 0.0, 0.0),
+        ),
+        show_viewer=show_viewer,
     )
     human = scene.add_entity(
-        morph=gs.morphs.URDF(file=str(urdf), fixed=False, default_armature=0.0),
+        morph=gs.morphs.URDF(
+            file=skin_articulation,
+            default_armature=0.0,
+        ),
         material=gs.materials.Hybrid(
             material_rigid=gs.materials.Rigid(),
-            material_soft=gs.materials.MPM.Elastic(E=1000.0, nu=0.2, rho=1000.0, model="neohooken"),
-            material_soft_palette=(gs.materials.MPM.Elastic(E=2000.0, nu=0.2, rho=2000.0, model="neohooken"),)
+            material_soft=gs.materials.MPM.Elastic(
+                E=1000.0,
+                nu=0.2,
+                rho=1000.0,
+                model="neohooken",
+            ),
+            material_soft_palette=(
+                gs.materials.MPM.Elastic(
+                    E=2000.0,
+                    nu=0.2,
+                    rho=2000.0,
+                    model="neohooken",
+                ),
+            )
             if heterogeneous
             else (),
             skin=gs.options.HybridSkinOptions(
@@ -57,8 +91,17 @@ def test_continuous_skin_binding(n_envs, heterogeneous, tmp_path, tol):
                     "weights": np.tile([0.25, 0.75], (len(surface.vertices), 1)),
                 },
             ),
-            binding=gs.options.HybridBindingOptions(timeconst=0.01, damping_ratio=0.0),
-            mass=gs.options.HybridMassOptions(mode="split_total", total_mass=5.0, soft_mass_fraction=0.2),
+            binding=gs.options.HybridBindingOptions(
+                timeconst=0.01,
+                damping_ratio=0.0,
+                max_correction_force=0.05 if heterogeneous else None,
+                phase=phase,
+            ),
+            mass=gs.options.HybridMassOptions(
+                mode="split_total",
+                total_mass=5.0,
+                soft_mass_fraction=0.2,
+            ),
         ),
     )
     scene.build(n_envs=n_envs)
@@ -69,32 +112,35 @@ def test_continuous_skin_binding(n_envs, heterogeneous, tmp_path, tol):
     assert_allclose(mass.soft_total, 1.0, tol=1e-6)
     assert_allclose(mass.soft_mass_by_weighted_link, (0.25, 0.75), tol=1e-6)
     binding = human.get_binding_diagnostics()
-    assert_allclose(binding["weights"][:, :2], (0.75, 0.25), tol=1e-6)
-    assert_allclose(binding["weights"].sum(dim=-1), 1.0, tol=1e-6)
-    assert (binding["active_count"] == 2).all()
+    assert_allclose(binding.weights[:, :2], (0.75, 0.25), tol=1e-6)
+    assert_allclose(binding.weights.sum(dim=-1), 1.0, tol=1e-6)
+    assert (binding.active_count == 2).all()
     if heterogeneous:
-        assert set(binding["material_id"].tolist()) == {0, 1}
+        assert set(binding.material_id.tolist()) == {0, 1}
         assert_allclose(
-            binding["particle_mass"][binding["material_id"] == 1].mean(),
-            2.0 * binding["particle_mass"][binding["material_id"] == 0].mean(),
+            binding.particle_mass[binding.material_id == 1].mean(),
+            2.0 * binding.particle_mass[binding.material_id == 0].mean(),
             tol=1e-8,
         )
-        assert torch.equal(binding["surface_contact"], binding["material_id"] == 0)
+        assert_equal(binding.surface_contact, binding.material_id == 0)
     initial = human.part_soft.get_particles_pos().clone()
     scene.step()
     assert_allclose(human.part_soft.get_particles_pos(), initial, tol=1e-6)
-    assert_allclose(human.get_binding_diagnostics()["attach_pos_err_max"], 0.0, tol=1e-6)
+    assert_allclose(human.get_binding_diagnostics().attach_pos_err_max, 0.0, tol=1e-6)
+    displaced_position = initial + torch.tensor((0.0, 0.0, 1e-4), dtype=gs.tc_float, device=gs.device)
+    human.part_soft.set_particles_pos(displaced_position)
     velocity = torch.tensor((0.0, 0.05, 0.0), dtype=gs.tc_float, device=gs.device)
     human.part_soft.set_particles_vel(velocity)
     initial_linear_momentum = velocity * mass.soft_total[..., None]
     initial_angular_momentum = (
-        torch.linalg.cross(initial, velocity.expand_as(initial)) * binding["particle_mass"][..., None]
+        torch.linalg.cross(displaced_position, velocity.expand_as(initial)) * binding.particle_mass[..., None]
     ).sum(dim=-2)
     scene.step()
     diagnostics = human.get_binding_diagnostics()
+    assert (torch.linalg.vector_norm(diagnostics.attach_impulse_sum, dim=-1) > 1e-5).all()
     force, torque = human.get_attachment_link_wrench()
-    assert_allclose(force.sum(dim=1) * scene.dt, -diagnostics["attach_impulse_sum"], tol=1e-8)
-    assert_allclose(torque.sum(dim=1) * scene.dt, -diagnostics["attach_ang_impulse_sum"], tol=1e-8)
+    assert_allclose(force.sum(dim=1) * scene.dt, -diagnostics.attach_impulse_sum, tol=1e-8)
+    assert_allclose(torque.sum(dim=1) * scene.dt, -diagnostics.attach_ang_impulse_sum, tol=1e-8)
     soft_velocity = human.part_soft.get_particles_vel()
     rigid_velocity = human.part_rigid.get_links_vel(ref=gs.link_ref_frame.link_COM)
     rigid_position = human.part_rigid.get_links_pos(ref=gs.link_ref_frame.link_COM)
@@ -103,23 +149,48 @@ def test_continuous_skin_binding(n_envs, heterogeneous, tmp_path, tol):
         rigid_velocity = rigid_velocity[None]
         rigid_position = rigid_position[None]
         rigid_angular_velocity = rigid_angular_velocity[None]
-    soft_momentum = (soft_velocity * binding["particle_mass"][..., None]).sum(dim=-2)
+    soft_momentum = (soft_velocity * binding.particle_mass[..., None]).sum(dim=-2)
     rigid_momentum = (rigid_velocity * mass.per_rigid_link[..., None]).sum(dim=-2)
     assert_allclose(rigid_momentum + soft_momentum, initial_linear_momentum, tol=2e-7)
     soft_angular_momentum = (
-        torch.linalg.cross(human.part_soft.get_particles_pos(), soft_velocity) * binding["particle_mass"][..., None]
+        torch.linalg.cross(human.part_soft.get_particles_pos(), soft_velocity) * binding.particle_mass[..., None]
     ).sum(dim=-2)
-    # The authored inertias are 0.1 I and split_total leaves the rigid masses unchanged.
+    inertia = torch.tensor(
+        ((0.11, 0.02, 0.01), (0.02, 0.09, 0.015), (0.01, 0.015, 0.13)), dtype=gs.tc_float, device=gs.device
+    )
+    rotation_world = geom.quat_to_R(human.part_rigid.get_links_quat())
+    inertia_world = rotation_world @ inertia @ rotation_world.transpose(-1, -2)
     rigid_angular_momentum = (
-        0.1 * rigid_angular_velocity
+        (inertia_world @ rigid_angular_velocity[..., None])[..., 0]
         + torch.linalg.cross(rigid_position, rigid_velocity * mass.per_rigid_link[..., None])
     ).sum(dim=-2)
     assert_allclose(rigid_angular_momentum + soft_angular_momentum, initial_angular_momentum, tol=2e-7)
     snapshot = scene.get_state()
+    if n_envs:
+        scene.reset(envs_idx=[1])
+    expected_diagnostics = human.get_binding_diagnostics()
+    expected_force, expected_torque = human.get_attachment_link_wrench()
     expected_soft_velocity = human.part_soft.get_particles_vel().clone()
     human.set_attachment_params(timeconst=0.02, damping_ratio=0.5)
     selection = [0] if n_envs else None
+    scene.reset(envs_idx=selection)
+    assert_equal(human.get_binding_diagnostics().attach_impulse_sum[0], 0)
+    assert_equal(human.get_attachment_link_wrench()[0][0], 0)
+    if n_envs:
+        assert_equal(human.get_binding_diagnostics().attach_impulse_sum[1], expected_diagnostics.attach_impulse_sum[1])
     scene.reset(snapshot, envs_idx=selection)
+    for restore_selection in (selection, torch.tensor([True, False], device=gs.device)) if n_envs else (None,):
+        scene.reset(snapshot, envs_idx=restore_selection)
+        restored_diagnostics = human.get_binding_diagnostics()
+        for name, value in vars(expected_diagnostics).items():
+            if isinstance(value, torch.Tensor):
+                assert_equal(vars(restored_diagnostics)[name], value)
+            else:
+                assert vars(restored_diagnostics)[name] == value
+        restored_force, restored_torque = human.get_attachment_link_wrench()
+        assert_equal(restored_force, expected_force)
+        assert_equal(restored_torque, expected_torque)
+    assert (torch.linalg.vector_norm(diagnostics.attach_impulse_sum, dim=-1) > 1e-5).all()
     state = scene.sim.mpm_solver.get_state(scene.sim.cur_substep_local)
     assert_allclose(state.attachment_omega[0], 100.0, tol=1e-8)
     assert_allclose(state.attachment_damping_ratio[0], 0.0, tol=1e-8)
@@ -131,12 +202,19 @@ def test_continuous_skin_binding(n_envs, heterogeneous, tmp_path, tol):
     angle = 0.2
     human.part_rigid.set_dofs_position(angle, dofs_idx_local=[6])
     particles = tensor_to_array(initial[0] if n_envs else initial, dtype=np.float64)
-    particle_mass = tensor_to_array(binding["particle_mass"], dtype=np.float64)
+    particle_mass = tensor_to_array(binding.particle_mass, dtype=np.float64)
     tip_offset = np.array((0.2, 0.0, 0.0))
-    c, s = np.cos(angle), np.sin(angle)
+    tip_quat = human.part_rigid.links[1].get_quat()
+    tip_quat = tensor_to_array(tip_quat[0] if n_envs else tip_quat, dtype=np.float64)
+    angle_realized = 2.0 * np.arctan2(tip_quat[3], tip_quat[0])
+    c, s = np.cos(angle_realized), np.sin(angle_realized)
     rotation = np.array(((c, -s, 0.0), (s, c, 0.0), (0.0, 0.0, 1.0)))
     tip_anchors = (particles - tip_offset) @ rotation.T + tip_offset
     force_expected = particle_mass[:, None] * 0.75 * (tip_anchors - particles) / 0.01**2
+    if heterogeneous:
+        force_norm = np.linalg.norm(force_expected, axis=-1)
+        assert (force_norm > 0.05).any()
+        force_expected *= np.minimum(1.0, 0.05 / np.maximum(force_norm, gs.EPS))[:, None]
     scene.step()
     force, torque = human.get_attachment_link_wrench()
     assert_allclose(force[:, 0], (-0.25 * force_expected).sum(axis=0), tol=tol)
@@ -144,14 +222,25 @@ def test_continuous_skin_binding(n_envs, heterogeneous, tmp_path, tol):
     assert_allclose(torque[:, 0], np.cross(particles, -0.25 * force_expected).sum(axis=0), tol=tol)
     assert_allclose(torque[:, 1], np.cross(tip_anchors, -0.75 * force_expected).sum(axis=0), tol=tol)
     diagnostics = human.get_binding_diagnostics()
-    assert_allclose(diagnostics["damping_work"], 0.0, atol=gs.EPS)
-    # Local stability bound at this pose: both links are free with 2 kg and isotropic inertia 0.1, the spring lever
-    # arm is the larger of the particle and anchor distances to the link center of mass, and damping is zero.
-    link_idx = tensor_to_array(binding["link_idx"])
-    weights = tensor_to_array(binding["weights"], dtype=np.float64)
+    assert_allclose(diagnostics.damping_work, 0.0, atol=gs.EPS)
+    potential = 0.5 * (particle_mass[:, None] * (0.75 * (tip_anchors - particles)) ** 2).sum() / 0.01**2
+    assert_allclose(diagnostics.spring_potential, potential, tol=tol)
+    if not heterogeneous:
+        potentials = []
+        for delta in (-1e-4, 1e-4):
+            cosine, sine = np.cos(angle_realized + delta), np.sin(angle_realized + delta)
+            rotation_delta = np.array(((cosine, -sine, 0.0), (sine, cosine, 0.0), (0.0, 0.0, 1.0)))
+            offset_delta = 0.75 * ((particles - tip_offset) @ rotation_delta.T + tip_offset - particles)
+            potentials.append(0.5 * (particle_mass[:, None] * offset_delta**2).sum() / 0.01**2)
+        torque_joint = torque[:, 1, 2] - 0.2 * force[:, 1, 1]
+        assert_allclose(torque_joint, -(potentials[1] - potentials[0]) / 2e-4, tol=1e-6)
+    # A free-link block-row norm bounds articulation mobility using both spring and damping lever arms.
+    link_idx = tensor_to_array(binding.link_idx)
+    weights = tensor_to_array(binding.weights, dtype=np.float64)
     is_tip = link_idx == human.part_rigid.links[1].idx
     anchors = np.where(is_tip[..., None], tip_anchors[:, None], particles[:, None])
-    centers = np.where(is_tip[..., None], tip_offset, 0.0)
+    center_local = np.array((0.02, 0.01, -0.01))
+    centers = np.where(is_tip[..., None], rotation @ center_local + tip_offset, center_local)
     radius = np.maximum(
         np.linalg.norm(particles[:, None] - centers, axis=-1), np.linalg.norm(anchors - centers, axis=-1)
     )
@@ -165,12 +254,79 @@ def test_continuous_skin_binding(n_envs, heterogeneous, tmp_path, tol):
         (particle_mass[:, None] * weights * radius)[is_tip].sum(),
         (particle_mass[:, None] * weights * radius)[~is_tip & (link_idx >= 0)].sum(),
     )
-    mobility = (weights * (link_soft_mass / 2.0 + radius * link_weighted_radius * np.sqrt(3.0) / 0.1)).sum(axis=-1)
-    assert_allclose(diagnostics["stability_index"], (1.0 + mobility.max()) * (scene.dt / 0.01) ** 2 / 2.0, tol=1e-6)
+    inverse_inertia_norm = np.linalg.norm(np.linalg.inv(tensor_to_array(inertia)))
+    mobility = (weights * (link_soft_mass / 2.0 + radius * link_weighted_radius * inverse_inertia_norm)).sum(axis=-1)
+    assert_allclose(diagnostics.stability_index, (1.0 + mobility.max()) * (scene.dt / 0.01) ** 2 / 2.0, tol=1e-6)
     human.set_attachment_params(damping_ratio=1.0)
     for _ in range(3):
         scene.step()
-    assert (human.get_binding_diagnostics()["damping_work"] < 0.0).all()
+    assert (human.get_binding_diagnostics().damping_work < 0.0).all()
+    scene.reset(initial_state)
+    human.part_rigid.set_dofs_position(angle, dofs_idx_local=[6])
+    human.set_attachment_params(damping_ratio=0.5)
+    velocity = np.array((0.03, -0.02, 0.01))
+    human.part_soft.set_particles_vel(velocity)
+    positions = particles + (scene.dt * velocity if phase == "after_coupling" else 0.0)
+    spring_force = particle_mass[:, None] * (0.25 * particles + 0.75 * tip_anchors - positions) / 0.01**2
+    damping_force = -particle_mass[:, None] * velocity / 0.01
+    if heterogeneous:
+        correction_norm = np.linalg.norm(spring_force + damping_force, axis=-1)
+        scale = np.minimum(1.0, 0.05 / np.maximum(correction_norm, gs.EPS))[:, None]
+        spring_force *= scale
+        damping_force *= scale
+    scene.step()
+    force, torque = human.get_attachment_link_wrench()
+    assert_allclose(force[:, 0], (-0.25 * (spring_force + damping_force)).sum(axis=0), tol=tol)
+    assert_allclose(force[:, 1], (-0.75 * (spring_force + damping_force)).sum(axis=0), tol=tol)
+    assert_allclose(
+        torque[:, 0],
+        -0.25 * (np.cross(particles, spring_force) + np.cross(positions, damping_force)).sum(axis=0),
+        tol=tol,
+    )
+    assert_allclose(
+        torque[:, 1],
+        -0.75 * (np.cross(tip_anchors, spring_force) + np.cross(positions, damping_force)).sum(axis=0),
+        tol=tol,
+    )
+    diagnostics = human.get_binding_diagnostics()
+    assert_allclose(force.sum(dim=1) * scene.dt, -diagnostics.attach_impulse_sum, tol=1e-8)
+    assert_allclose(torque.sum(dim=1) * scene.dt, -diagnostics.attach_ang_impulse_sum, tol=1e-8)
+    scene.reset(initial_state)
+    human.part_rigid.set_mass(0.004)
+    human.set_attachment_params(timeconst=0.005, damping_ratio=0.005)
+    displacement = torch.tensor((0.0, 1e-5, 0.0), dtype=gs.tc_float, device=gs.device)
+    human.part_soft.set_particles_pos(initial + displacement)
+    energy_initial = 0.5 * mass.soft_total * displacement.square().sum() / 0.005**2
+    energies = []
+    for _ in range(50):
+        scene.step()
+        soft_velocity = human.part_soft.get_particles_vel()
+        rigid_velocity = human.part_rigid.get_links_vel(ref=gs.link_ref_frame.link_COM)
+        rigid_angular_velocity = human.part_rigid.get_links_ang()
+        rotation_world = geom.quat_to_R(human.part_rigid.get_links_quat())
+        inertia_world = rotation_world @ (0.001 * inertia) @ rotation_world.transpose(-1, -2)
+        position_world = human.part_rigid.get_links_pos()
+        target = 0.25 * (
+            (initial @ rotation_world[..., 0, :, :].transpose(-1, -2)) + position_world[..., 0, None, :]
+        ) + 0.75 * (
+            ((initial - initial.new_tensor(tip_offset)) @ rotation_world[..., 1, :, :].transpose(-1, -2))
+            + position_world[..., 1, None, :]
+        )
+        energy_potential = (
+            0.5
+            * (binding.particle_mass * (target - human.part_soft.get_particles_pos()).square().sum(dim=-1)).sum(dim=-1)
+        ) / 0.005**2
+        energy_kinetic = 0.5 * (
+            (soft_velocity.square().sum(dim=-1) * binding.particle_mass).sum(dim=-1)
+            + (rigid_velocity.square().sum(dim=-1) * (0.001 * mass.per_rigid_link)).sum(dim=-1)
+            + (rigid_angular_velocity * (inertia_world @ rigid_angular_velocity[..., None])[..., 0]).sum(dim=(-1, -2))
+        )
+        energies.append(energy_kinetic + energy_potential)
+    assert (torch.stack(energies) < 1.5 * energy_initial).all()
+    assert (energies[-1] < 0.25 * energy_initial).all()
+    soft_momentum = (soft_velocity * binding.particle_mass[..., None]).sum(dim=-2)
+    rigid_momentum = (rigid_velocity * (0.001 * mass.per_rigid_link[..., None])).sum(dim=-2)
+    assert_allclose(rigid_momentum + soft_momentum, 0.0, atol=2e-7)
     with pytest.raises(gs.GenesisException, match="timeconst"):
         human.set_attachment_params(timeconst=0.0)
     human.set_attachment_params(timeconst=scene.dt)
@@ -677,41 +833,65 @@ def test_sap_fem_vs_robot(show_viewer):
 @pytest.mark.required
 @pytest.mark.parametrize("approaching", [False, True])
 @pytest.mark.parametrize("n_envs", [0, 2])
-def test_mpm_regions_do_not_weld(approaching, n_envs, tol):
+def test_mpm_regions_do_not_weld(approaching, n_envs, show_viewer, tol):
     scene = gs.Scene(
-        sim_options=gs.options.SimOptions(dt=1e-4, gravity=(0.0, 0.0, 0.0)),
+        sim_options=gs.options.SimOptions(
+            dt=1e-4,
+            gravity=(0.0, 0.0, 0.0),
+        ),
         mpm_options=gs.options.MPMOptions(
             lower_bound=(-0.5, -0.5, -0.5),
             upper_bound=(0.5, 0.5, 0.5),
             grid_density=32,
             particle_size=0.02,
         ),
-        show_viewer=False,
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.8, 1.0, 0.8),
+            camera_lookat=(0.0, 0.0, 0.0),
+        ),
+        show_viewer=show_viewer,
     )
-    entities = [
-        scene.add_entity(
-            morph=gs.morphs.Box(pos=(x, 0.0, 0.0), size=(0.02, 0.08, 0.08)),
-            material=gs.materials.MPM.Elastic(E=100.0, nu=0.2, rho=1000.0, sampler="regular"),
-        )
-        for x in (-0.015, 0.015)
-    ]
+    pairs = []
+    for y, frictions in ((-0.25, (1.0, 1.0)), (0.0, (0.0, 0.64)), (0.25, (0.25, 0.64))):
+        entities = []
+        for x, friction in zip((-0.015, 0.015), frictions):
+            material = gs.materials.MPM.Elastic(E=100.0, nu=0.2, rho=1000.0, sampler="regular")
+            if y >= 0.0:
+                material.friction = friction
+            entities.append(
+                scene.add_entity(
+                    morph=gs.morphs.Box(
+                        pos=(x, y, 0.0),
+                        size=(0.02, 0.08, 0.08),
+                    ),
+                    material=material,
+                )
+            )
+        pairs.append(entities)
     scene.build(n_envs=n_envs)
     speed = 0.1 if approaching else -0.1
-    for i, entity in enumerate(entities):
-        entity.set_particles_vel(((-1) ** i * speed, 0.0, 0.0))
-    initial_positions = [entity.get_particles_pos().clone() for entity in entities]
+    for entities in pairs:
+        for i, entity in enumerate(entities):
+            entity.set_particles_vel(((-1) ** i * speed, (-1) ** i, 0.0))
+    initial_positions = [[entity.get_particles_pos() for entity in entities] for entities in pairs]
     scene.step()
-    velocities = [entity.get_particles_vel() for entity in entities]
-    assert_allclose(velocities[0].sum(dim=-2) + velocities[1].sum(dim=-2), 0.0, tol=tol)
-    for i, entity in enumerate(entities):
-        assert_allclose(velocities[i][..., 1:], 0.0, tol=tol)
-        if approaching:
-            assert (velocities[i][..., 0].abs() < 0.09).all()
-        else:
-            expected = ((-1) ** i * speed, 0.0, 0.0)
-            assert_allclose(velocities[i], expected, tol=tol)
-            assert_allclose(
-                entity.get_particles_pos(),
-                initial_positions[i] + scene.dt * torch.tensor(expected, dtype=gs.tc_float, device=gs.device),
-                tol=tol,
-            )
+    for entities, positions in zip(pairs, initial_positions):
+        velocities = [entity.get_particles_vel() for entity in entities]
+        assert_allclose(velocities[0].sum(dim=-2) + velocities[1].sum(dim=-2), 0.0, tol=tol)
+        friction = (entities[0].material.friction * entities[1].material.friction) ** 0.5
+        for i, entity in enumerate(entities):
+            assert_allclose(velocities[i][..., 2], 0.0, tol=tol)
+            if approaching:
+                assert (velocities[i][..., 0].abs() < 0.09).all()
+                impulse_per_mass = torch.tensor(
+                    ((-1) ** i * speed, (-1) ** i, 0.0), dtype=gs.tc_float, device=gs.device
+                ) - velocities[i].mean(dim=-2)
+                assert_allclose(impulse_per_mass[..., 1], friction * impulse_per_mass[..., 0], atol=1e-7)
+            else:
+                expected = ((-1) ** i * speed, (-1) ** i, 0.0)
+                assert_allclose(velocities[i], expected, tol=tol)
+                assert_allclose(
+                    entity.get_particles_pos(),
+                    positions[i] + scene.dt * torch.tensor(expected, dtype=gs.tc_float, device=gs.device),
+                    tol=tol,
+                )

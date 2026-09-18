@@ -24,7 +24,12 @@ import torch
 
 import genesis as gs
 from genesis.engine.solvers import KinematicSolver
-from genesis.engine.states.solvers import KinematicSolverCheckpoint, SimulatorCheckpoint, SolverCheckpoint
+from genesis.engine.states.solvers import (
+    STATE_SCHEMA_VERSION,
+    KinematicSolverCheckpoint,
+    SimulatorCheckpoint,
+    SolverCheckpoint,
+)
 from genesis.options.recorders import TrajectoryFile
 from genesis.utils import serialization
 from genesis.utils.array_class import CHECKPOINT_KINDS, DataKind
@@ -164,6 +169,7 @@ def _header(
     description = io.BytesIO()
     serialization.export(description, {"scene": desc})
     manifest = {
+        "state_schema_version": STATE_SCHEMA_VERSION,
         "genesis": gs.__version__,
         "source": serialization.source_digest(),
         "backend": gs.backend.name,
@@ -396,6 +402,14 @@ class Trajectory:
                 gs.raise_exception(f"'{path}' is not a Genesis trajectory.")
             (length,) = LENGTH.unpack(file.read(LENGTH.size))
             self._manifest = json.loads(file.read(length))
+            self._state_schema_version = self._manifest.get("state_schema_version", 1)
+            if type(self._state_schema_version) is not int or self._state_schema_version not in (
+                1,
+                STATE_SCHEMA_VERSION,
+            ):
+                gs.raise_exception(
+                    f"'{path}' holds unsupported trajectory state schema version {self._state_schema_version!r}."
+                )
             (length,) = LENGTH.unpack(file.read(LENGTH.size))
             description = file.read(length)
             self._fields = _fields_from_json(self._manifest["fields"])
@@ -537,7 +551,13 @@ class Trajectory:
                 solvers[solver_name] = SolverCheckpoint(solver_arrays, {}, kinds)
         sim = SimulatorCheckpoint(steps=values[STEPS_FIELD], solvers=solvers)
         self._scene.__setstate__(
-            self._checkpoint_class(scene=self._scene.desc, digest=self._digest, layout=self._layout, sim=sim)
+            self._checkpoint_class(
+                scene=self._scene.desc,
+                digest=self._digest,
+                layout=self._layout,
+                sim=sim,
+                state_schema_version=self._state_schema_version,
+            )
         )
 
     def play(self, loop: bool = False) -> None:

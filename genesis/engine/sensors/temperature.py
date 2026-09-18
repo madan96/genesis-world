@@ -669,6 +669,12 @@ class TemperatureGridSensor(
         return gs.tc_float
 
     @classmethod
+    def state_tensors(cls, shared_metadata: TemperatureGridSensorMetadata):
+        yield from super().state_tensors(shared_metadata)
+        if shared_metadata.link_temps.numel() > 0:
+            yield "link_temperatures", shared_metadata.link_temps
+
+    @classmethod
     def reset(cls, shared_metadata: TemperatureGridSensorMetadata, current_ground_truth_data_T: torch.Tensor, envs_idx):
         super().reset(shared_metadata, current_ground_truth_data_T, envs_idx)
         sensors_mat_idx = shared_metadata.link_to_material_idx[shared_metadata.links_idx]

@@ -614,14 +614,19 @@ def has_display() -> bool:
 
 
 def indices_to_mask(
-    *indices: Any, keepdim: bool = True, to_torch: bool = True, boolean_mask: bool = True, raise_if_fancy: bool = False
+    *indices: Any,
+    keepdim: bool = True,
+    to_torch: bool = True,
+    boolean_mask: bool = True,
+    raise_if_fancy: bool = False,
+    axis_sizes: tuple[int, ...] | None = None,
 ) -> tuple[slice | int | torch.Tensor, ...]:
     """Converts a sequence of slice-like objects into a multi-dimensional mask corresponding to their cross-product.
 
     Out-of-bound access is not asserted at runtime: checking it would require reading the indices back from the GPU,
     which stalls the GPU and dramatically impedes performance, in exchange for catching a mistake that should never
     happen in production. On the contrary, an index outside the valid range selects nothing instead of raising an
-    error, and so does a range or slice counted from the end whose start lies past its stop.
+    error. Ranges preserve Python's element order and negative-index wrapping.
 
     Args:
         keepdim (bool): Whether to keep all dimensions even if masks are integers. Defaults to True.
@@ -634,6 +639,8 @@ def indices_to_mask(
         once is always converted, because the cross-product needs one index per axis.
         raise_if_fancy (bool): Whether to raise if the resulting mask requires advanced indexing (aka. fancy
         indexing), which would make extracting a slice copy.
+        axis_sizes (tuple[int, ...] | None): Sizes of the indexed axes. Required for negative-step slices when
+        to_torch=True, because Torch represents reversed selections with integer indices.
     """
     mask: list[slice | int | torch.Tensor] = []
 
@@ -648,6 +655,12 @@ def indices_to_mask(
             arg = slice(None)
         else:
             is_all_none = False
+            if isinstance(arg, slice) and arg.step is not None and arg.step < 0 and to_torch:
+                if axis_sizes is None:
+                    gs.raise_exception("Negative-step Torch selections require axis_sizes.")
+                arg = range(*arg.indices(axis_sizes[i]))
+            if isinstance(arg, range) and (arg.start < 0 or arg.stop < 0 or arg.step < 0):
+                arg = tuple(arg)
             if (arg_type := type(arg)) is slice:
                 pass
             elif arg_type is range:
