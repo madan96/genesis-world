@@ -298,18 +298,49 @@ def test_get_constraints_api(show_viewer, tol):
     scene.build(n_envs=2)
 
     link_a, link_b = robot.base_link.idx, cube.base_link.idx
-    scene.sim.rigid_solver.add_weld_constraint(link_a, link_b, envs_idx=[1])
+    solver = scene.rigid_solver
+    solver.add_weld_constraint(link_a, link_b, envs_idx=[1])
     with np.testing.assert_raises(AssertionError):
-        scene.sim.rigid_solver.add_weld_constraint(link_a, link_b, envs_idx=[1])
+        solver.add_weld_constraint(link_a, link_b, envs_idx=[1])
 
     for as_tensor, to_torch in ((True, True), (True, False), (False, True), (False, False)):
-        weld_const_info = scene.sim.rigid_solver.get_weld_constraints(as_tensor, to_torch)
+        weld_const_info = solver.get_weld_constraints(as_tensor, to_torch)
         link_a_, link_b_ = weld_const_info["link_a"], weld_const_info["link_b"]
         if as_tensor:
             assert_allclose((link_a_[0], link_b_[0]), ((-1,), (-1,)), tol=0)
         else:
             assert_allclose((link_a_[0], link_b_[0]), ((), ()), tol=0)
         assert_allclose((link_a_[1], link_b_[1]), ((link_a,), (link_b,)), tol=0)
+
+    # Overlap with an existing pair rejects the whole request before any copy changes.
+    for first, second, selection in ((link_a, link_b, [0, 1]), (link_b, link_a, None)):
+        with pytest.raises(AssertionError):
+            solver.add_weld_constraint(first, second, envs_idx=selection)
+        welds = solver.get_weld_constraints()
+        assert_equal(welds["link_a"], [[-1], [link_a]])
+        assert_equal(welds["link_b"], [[-1], [link_b]])
+
+    solver.add_weld_constraint(link_a, link_b, envs_idx=[0])
+    welds = solver.get_weld_constraints()
+    assert_equal(welds["link_a"], [[link_a], [link_a]])
+    assert_equal(welds["link_b"], [[link_b], [link_b]])
+    solver.delete_weld_constraint(link_a, link_b, envs_idx=[0])
+
+    solver.add_weld_constraint(link_b, link_a, envs_idx=[0])
+    welds = solver.get_weld_constraints()
+    assert_equal(welds["link_a"], [[link_b], [link_a]])
+    assert_equal(welds["link_b"], [[link_a], [link_b]])
+    with pytest.raises(AssertionError):
+        solver.add_weld_constraint(link_a, link_b, envs_idx=[0])
+
+    solver.delete_weld_constraint(link_a, link_b, envs_idx=[1])
+    welds = solver.get_weld_constraints()
+    assert_equal(welds["link_a"], [[link_b], [-1]])
+    assert_equal(welds["link_b"], [[link_a], [-1]])
+    solver.add_weld_constraint(link_a, link_b, envs_idx=[1])
+    welds = solver.get_weld_constraints()
+    assert_equal(welds["link_a"], [[link_b], [link_a]])
+    assert_equal(welds["link_b"], [[link_a], [link_b]])
 
 
 @pytest.mark.slow  # ~200s

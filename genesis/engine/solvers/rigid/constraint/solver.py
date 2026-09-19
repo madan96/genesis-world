@@ -421,8 +421,9 @@ class ConstraintSolver:
 
         assert link1_idx >= 0 and link2_idx >= 0
         weld_const_info = self.get_weld_constraints(as_tensor=True, to_torch=True)
-        link_a = weld_const_info["link_a"]
-        link_b = weld_const_info["link_b"]
+        envs_mask = indices_to_mask(envs_idx)
+        link_a = weld_const_info["link_a"][envs_mask]
+        link_b = weld_const_info["link_b"][envs_mask]
         assert not (
             ((link_a == link1_idx) | (link_b == link1_idx)) & ((link_a == link2_idx) | (link_b == link2_idx))
         ).any()
