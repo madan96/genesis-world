@@ -220,6 +220,7 @@ def func_gjk_contact(
                 pos_b,
                 quat_b,
                 shrink_sphere,
+                shrink_sphere,
                 collider_state,
                 gjk_state,
                 dyn_info,
@@ -442,6 +443,89 @@ def func_gjk_contact(
     gjk_state.penetration[i_b] = 0.0 if n_contacts == 0 else gjk_state.penetration[i_b]
 
 
+@qd.kernel(fastcache=True)
+def kernel_get_geoms_distance(
+    geoms_pair_idx: qd.types.ndarray(),
+    envs_idx: qd.types.ndarray(),
+    distmax: float,
+    tensor: qd.types.ndarray(),
+    dyn_state: array_class.DynState,
+    collider_state: array_class.ColliderState,
+    gjk_state: array_class.GJKState,
+    dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
+    collider_info: array_class.ColliderInfo,
+    rigid_config: qd.template(),
+    collider_static_config: qd.template(),
+    gjk_static_config: qd.template(),
+):
+    # The GJK work buffers are per environment, so the pairs of one environment run in sequence while environments
+    # run in parallel.
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
+    for i_b in range(gjk_state.distance.shape[0]):
+        for i_p in range(geoms_pair_idx.shape[0]):
+            if envs_idx[i_p] == i_b:
+                i_ga = geoms_pair_idx[i_p, 0]
+                i_gb = geoms_pair_idx[i_p, 1]
+                ga_pos = dyn_state.geoms.pos[i_ga, i_b]
+                ga_quat = dyn_state.geoms.quat[i_ga, i_b]
+                gb_pos = dyn_state.geoms.pos[i_gb, i_b]
+                gb_quat = dyn_state.geoms.quat[i_gb, i_b]
+                is_sphere_swept_geom_a = func_is_sphere_swept_geom(i_ga, dyn_info)
+                is_sphere_swept_geom_b = func_is_sphere_swept_geom(i_gb, dyn_info)
+                # Shrinking also reduces a cylinder to its axis, whose radius would then be missing from the distance.
+                shrink_sphere = (
+                    (is_sphere_swept_geom_a or is_sphere_swept_geom_b)
+                    and dyn_info.geoms.type[i_ga] != gs.GEOM_TYPE.CYLINDER
+                    and dyn_info.geoms.type[i_gb] != gs.GEOM_TYPE.CYLINDER
+                )
+                clear_cache(i_b, gjk_state)
+                distance = func_gjk(
+                    i_ga,
+                    i_gb,
+                    i_b,
+                    ga_pos,
+                    ga_quat,
+                    gb_pos,
+                    gb_quat,
+                    shrink_sphere,
+                    get_dist=True,
+                    collider_state=collider_state,
+                    gjk_state=gjk_state,
+                    dyn_info=dyn_info,
+                    collider_info=collider_info,
+                    rigid_config=rigid_config,
+                    collider_static_config=collider_static_config,
+                )
+                if distance > collider_info.gjk.collision_eps[None]:
+                    if shrink_sphere:
+                        if is_sphere_swept_geom_a:
+                            distance -= dyn_info.geoms.data[i_ga][0]
+                        if is_sphere_swept_geom_b:
+                            distance -= dyn_info.geoms.data[i_gb][0]
+                else:
+                    func_gjk_contact(
+                        i_ga,
+                        i_gb,
+                        i_b,
+                        ga_pos,
+                        ga_quat,
+                        gb_pos,
+                        gb_quat,
+                        dyn_state,
+                        collider_state,
+                        gjk_state,
+                        dyn_info,
+                        rigid_info,
+                        collider_info,
+                        rigid_config,
+                        collider_static_config,
+                        gjk_static_config,
+                    )
+                    distance = -gjk_state.penetration[i_b]
+                tensor[i_p] = qd.min(distance, distmax)
+
+
 @qd.func
 def func_gjk(
     i_ga,
@@ -452,6 +536,7 @@ def func_gjk(
     pos_b: qd.types.vector(3),
     quat_b: qd.types.vector(4),
     shrink_sphere,
+    get_dist,
     collider_state: array_class.ColliderState,
     gjk_state: array_class.GJKState,
     dyn_info: array_class.DynInfo,
@@ -472,6 +557,9 @@ def func_gjk(
         If True, use point and line support functions for sphere and capsule geometries, respectively. It is more
         efficient and stable for shallow penetrations than the full GJK algorithm. However, if there is a deep
         penetration, we have to fallback to the full GJK algorithm by setting this parameter to False.
+    get_dist: bool
+        If True, compute the minimum distance between separated geometries. Otherwise, stop as soon as the geometries
+        are known to be separated or intersecting, and report FLOAT_MAX for separated ones.
 
     .. seealso::
     MuJoCo's original implementation:
@@ -499,8 +587,6 @@ def func_gjk(
     dist = gs.qd_float(0.0)
     # Lambda for barycentric coordinates
     _lambda = gs.qd_vec4(1.0, 0.0, 0.0, 0.0)
-    # Whether or not we need to compute the exact distance.
-    get_dist = shrink_sphere
     # We can use GJK intersection algorithm only for collision detection if we do not have to compute the distance.
     backup_gjk = not get_dist
     # Support vector to compute the next support point.

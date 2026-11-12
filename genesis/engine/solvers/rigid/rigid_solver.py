@@ -42,6 +42,7 @@ from ..kinematic_solver import (
     _select_links_offset,
 )
 from .collider import Collider
+from .collider.gjk import kernel_get_geoms_distance
 from .constraint import ConstraintSolver
 from .constraint.backward import (
     kernel_accumulate_constraint_solver_grads,
@@ -3072,6 +3073,66 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             offset_quat = self._geoms_offset_quat if geoms_idx is None else self._geoms_offset_quat[geoms_idx]
             tensor = gu.transform_quat_by_quat(gu.inv_quat(offset_quat), tensor)
         return tensor[0] if self.n_envs == 0 else tensor
+
+    def get_geoms_distance(self, geoms_pair_idx, envs_idx=None, *, distmax):
+        """
+        Signed distance between pairs of collision geometries at their current poses.
+
+        Each geometry is taken as the convex shape the collider uses for it. The distance is computed by GJK, and the
+        penetration depth of intersecting pairs by EPA. Collision filters (contype and conaffinity, adjacent and fixed
+        links, neutral-configuration overlaps) are not applied: every requested pair is measured.
+
+        Parameters
+        ----------
+        geoms_pair_idx : array_like, shape (n_pairs, 2)
+            Solver-level indices of the two geometries of each pair.
+        envs_idx : array_like, shape (n_pairs,), optional
+            Environment of each pair. Must be None for a scene without parallel environments.
+        distmax : float
+            Upper bound of the returned distances.
+
+        Returns
+        -------
+        distance : torch.Tensor, shape (n_pairs,)
+            Gap between separated geometries, or minus the penetration depth of intersecting ones, at most distmax.
+        """
+        if not self.collider._gjk.is_active:
+            gs.raise_exception(
+                "Geometry distances require the collider's GJK state, which is only allocated when some pair of "
+                "convex geometries has no specialized contact routine, for instance a convex mesh."
+            )
+        geoms_pair_idx = torch.as_tensor(geoms_pair_idx, dtype=gs.tc_int, device=gs.device)
+        if geoms_pair_idx.ndim != 2 or geoms_pair_idx.shape[1] != 2:
+            gs.raise_exception("'geoms_pair_idx' must have shape (n_pairs, 2).")
+        if ((geoms_pair_idx < 0) | (geoms_pair_idx >= self.n_geoms)).any():
+            gs.raise_exception("'geoms_pair_idx' contains an invalid geometry index.")
+        if envs_idx is None:
+            if self.n_envs > 0:
+                gs.raise_exception("'envs_idx' must name the environment of each pair of a batched scene.")
+            envs_idx = torch.zeros(len(geoms_pair_idx), dtype=gs.tc_int, device=gs.device)
+        else:
+            envs_idx = torch.as_tensor(envs_idx, dtype=gs.tc_int, device=gs.device)
+            if envs_idx.shape != geoms_pair_idx.shape[:1]:
+                gs.raise_exception("'envs_idx' must have shape (n_pairs,).")
+            if ((envs_idx < 0) | (envs_idx >= max(1, self.n_envs))).any():
+                gs.raise_exception("'envs_idx' contains an invalid environment index.")
+        tensor = torch.empty(len(geoms_pair_idx), dtype=gs.tc_float, device=gs.device)
+        kernel_get_geoms_distance(
+            geoms_pair_idx,
+            envs_idx,
+            float(distmax),
+            tensor,
+            self.dyn_state,
+            self.collider.collider_state,
+            self.collider._gjk.gjk_state,
+            self.dyn_info,
+            self.rigid_info,
+            self.collider.collider_info,
+            self.rigid_config,
+            self.collider.collider_config,
+            self.collider._gjk.gjk_config,
+        )
+        return tensor
 
     def get_dofs_control_force(self, dofs_idx=None, envs_idx=None):
         _tensor, dofs_idx, envs_idx = self._sanitize_io_variables(None, dofs_idx, self.n_dofs, "dofs_idx", envs_idx)

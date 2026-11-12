@@ -2903,6 +2903,7 @@ def _func_narrowphase_contact0(
                         gb_pos,
                         gb_quat,
                         shrink_sphere=False,
+                        get_dist=False,
                         collider_state=collider_state,
                         gjk_state=gjk_state,
                         dyn_info=dyn_info,

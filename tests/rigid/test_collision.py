@@ -1479,3 +1479,45 @@ def test_neutral_self_collision_masks_across_merged_entities(merged_overlapping_
     palm_geom = hand.get_link("palm").geoms[0].idx
     assert_equal(collision_pair_idx[a2_geom, palm_geom], -1)
     assert_equal(collision_pair_idx[palm_geom, a2_geom], -1)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
+def test_geoms_distance(tmp_path, show_viewer, tol):
+    # A unit box with its top face at z = 0.2, and shapes placed relative to it.
+    scene = gs.Scene(show_viewer=show_viewer)
+    box = scene.add_entity(gs.morphs.Box(pos=(0.0, 0.0, 0.1), size=(0.2, 0.2, 0.2), fixed=True))
+    sphere = scene.add_entity(gs.morphs.Sphere(pos=(0.0, 0.0, 0.3), radius=0.05))
+    cylinder = scene.add_entity(gs.morphs.Cylinder(pos=(0.5, 0.0, 0.3), radius=0.04, height=0.1, fixed=True))
+    box_2 = scene.add_entity(gs.morphs.Box(pos=(0.0, 0.5, 0.1), size=(0.2, 0.2, 0.2), fixed=True))
+    # A free convex mesh makes the collider allocate its GJK state.
+    mesh_path = tmp_path / "icosphere.obj"
+    trimesh.creation.icosphere(subdivisions=1, radius=0.05).export(mesh_path)
+    scene.add_entity(gs.morphs.Mesh(file=str(mesh_path), pos=(3.0, 3.0, 0.5)))
+    scene.build()
+    solver = scene.rigid_solver
+    g_box, g_sphere, g_cylinder, g_box_2 = (entity.geoms[0].idx for entity in (box, sphere, cylinder, box_2))
+
+    def distance(pairs, distmax=1.0):
+        return tensor_to_array(solver.get_geoms_distance(pairs, distmax=distmax))
+
+    # Separated pairs: the sphere centre 0.1 above the face; facing boxes 0.3 apart; the cylinder's lower rim
+    # (x=0.46, z=0.25) to the box's top edge (x=0.1, z=0.2); the sphere centre to the cylinder's side.
+    assert_allclose(
+        distance([(g_sphere, g_box), (g_box, g_box_2), (g_cylinder, g_box), (g_sphere, g_cylinder)]),
+        (0.05, 0.3, math.hypot(0.36, 0.05), 0.41),
+        tol=tol,
+    )
+    # The distance is capped.
+    assert_allclose(distance([(g_cylinder, g_box)], distmax=0.1), (0.1,), tol=tol)
+    # A sphere centre 0.03 above the face penetrates 0.02; 0.04 below it, 0.09.
+    sphere.set_pos((0.0, 0.0, 0.23))
+    assert_allclose(distance([(g_sphere, g_box)]), (-0.02,), tol=tol)
+    # The deep penetration comes from EPA, which converges to the collider's GJK tolerance of 1e-6.
+    sphere.set_pos((0.0, 0.0, 0.16))
+    assert_allclose(distance([(g_sphere, g_box)]), (-0.09,), tol=max(tol, 1e-6))
+    # Overlapping boxes, also by EPA.
+    box_2.set_pos((0.0, 0.17, 0.1))
+    assert_allclose(distance([(g_box, g_box_2)]), (-0.03,), tol=max(tol, 1e-6))
+    with pytest.raises(gs.GenesisException, match="geoms_pair_idx"):
+        solver.get_geoms_distance([(g_box, solver.n_geoms)], distmax=1.0)
